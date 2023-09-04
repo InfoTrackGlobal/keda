@@ -247,7 +247,7 @@ func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, http
 		meta.clientID = config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
 		meta.clientSecret = config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
 		meta.tenantID = config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
-		} else if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
+	} else if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
 		// Found the personalAccessToken in a parameter from TriggerAuthentication
 		meta.personalAccessToken = config.AuthParams["personalAccessToken"]
 	} else if val, ok := config.TriggerMetadata["personalAccessTokenFromEnv"]; ok && val != "" {
@@ -265,11 +265,6 @@ func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, http
 
 		// Use the token for further requests
 		meta.personalAccessToken = token
-	} else if meta.personalAccessToken != "" {
-		// Use personalAccessToken for authentication
-		fmt.Println("Personal Access Token:", meta.personalAccessToken)
-	} else {
-		return nil, fmt.Errorf("No valid authentication method provided")
 	}
 
 	if val, ok := config.TriggerMetadata["parent"]; ok && val != "" {
