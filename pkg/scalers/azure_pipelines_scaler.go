@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -127,6 +128,9 @@ type azurePipelinesScaler struct {
 type azurePipelinesMetadata struct {
 	organizationURL                      string
 	organizationName                     string
+	clientID							 string
+	clientSecret						 string
+	tenantID							 string
 	personalAccessToken                  string
 	parent                               string
 	demands                              string
@@ -158,6 +162,43 @@ func NewAzurePipelinesScaler(ctx context.Context, config *ScalerConfig) (Scaler,
 		httpClient: httpClient,
 		logger:     InitializeLogger(config, "azure_pipelines_scaler"),
 	}, nil
+}
+
+func getAccessTokenWithClientCredentials(ctx context.Context, clientID string, clientSecret string, tenantID string) (string, error) {
+	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", tenantID)
+
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("resource", "499b84ac-1321-427f-aa17-267ca6975798")
+
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		return "", err
+	}
+
+	return tokenResponse.AccessToken, nil
 }
 
 func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, httpClient *http.Client) (*azurePipelinesMetadata, error) {
@@ -198,13 +239,37 @@ func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, http
 		return nil, fmt.Errorf("failed to extract organization name from organizationURL")
 	}
 
-	if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
+	if val, ok := config.AuthParams["clientID"]; ok && val != "" {
+		meta.clientID = val
+		meta.clientSecret = config.AuthParams["clientSecret"]
+		meta.tenantID = config.AuthParams["tenantID"]
+	} else if val, ok := config.TriggerMetadata["clientIDFromEnv"]; ok && val != "" {
+		meta.clientID = config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
+		meta.clientSecret = config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
+		meta.tenantID = config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
+		} else if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
 		// Found the personalAccessToken in a parameter from TriggerAuthentication
 		meta.personalAccessToken = config.AuthParams["personalAccessToken"]
 	} else if val, ok := config.TriggerMetadata["personalAccessTokenFromEnv"]; ok && val != "" {
 		meta.personalAccessToken = config.ResolvedEnv[config.TriggerMetadata["personalAccessTokenFromEnv"]]
 	} else {
-		return nil, fmt.Errorf("no personalAccessToken given")
+		return nil, fmt.Errorf("no valid authentication method provided")
+	}
+
+	// Check if clientID and clientSecret are provided for authentication
+	if meta.clientID != "" {
+		token, err := getAccessTokenWithClientCredentials(ctx, meta.clientID, meta.clientSecret, meta.tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to obtain access token: %w\n", err)
+		}
+
+		// Use the token for further requests
+		meta.personalAccessToken = token
+	} else if meta.personalAccessToken != "" {
+		// Use personalAccessToken for authentication
+		fmt.Println("Personal Access Token:", meta.personalAccessToken)
+	} else {
+		return nil, fmt.Errorf("No valid authentication method provided")
 	}
 
 	if val, ok := config.TriggerMetadata["parent"]; ok && val != "" {
@@ -256,6 +321,8 @@ func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, http
 			return nil, fmt.Errorf("no poolName or poolID given")
 		}
 	}
+
+
 
 	// Trim any trailing new lines from the Azure Pipelines PAT
 	meta.personalAccessToken = strings.TrimSuffix(meta.personalAccessToken, "\n")
