@@ -128,9 +128,9 @@ type azurePipelinesScaler struct {
 type azurePipelinesMetadata struct {
 	organizationURL                      string
 	organizationName                     string
-	clientID							 string
-	clientSecret						 string
-	tenantID							 string
+	clientID                             string
+	clientSecret                         string
+	tenantID                             string
 	personalAccessToken                  string
 	parent                               string
 	demands                              string
@@ -321,8 +321,6 @@ func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, http
 			return nil, fmt.Errorf("no poolName or poolID given")
 		}
 	}
-
-
 
 	// Trim any trailing new lines from the Azure Pipelines PAT
 	meta.personalAccessToken = strings.TrimSuffix(meta.personalAccessToken, "\n")
