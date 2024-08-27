@@ -153,7 +153,7 @@ type azurePipelinesMetadata struct {
 }
 
 type authContext struct {
-	cred  *azidentity.ChainedTokenCredential
+	cred  azcore.TokenCredential
 	pat   string
 	token *azcore.AccessToken
 }
@@ -182,9 +182,23 @@ func NewAzurePipelinesScaler(ctx context.Context, config *scalersconfig.ScalerCo
 	}, nil
 }
 
-func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (string, *azidentity.ChainedTokenCredential, kedav1alpha1.AuthPodIdentity, error) {
+// Modified getAuthMethod function
+func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (string, azcore.TokenCredential, kedav1alpha1.AuthPodIdentity, error) {
+	// Check for service principal credentials from environment variables
+	clientID := ""
+	clientSecret := ""
+	tenantID := ""
 	pat := ""
-	if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
+
+	if val, ok := config.AuthParams["clientID"]; ok && val != "" {
+		clientID = val
+		clientSecret = config.AuthParams["clientSecret"]
+		tenantID = config.AuthParams["tenantID"]
+	} else if val, ok := config.TriggerMetadata["clientIDFromEnv"]; ok && val != "" {
+		clientID = config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
+		clientSecret = config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
+		tenantID = config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
+	} else if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
 		// Found the personalAccessToken in a parameter from TriggerAuthentication
 		pat = config.AuthParams["personalAccessToken"]
 	} else if val, ok := config.TriggerMetadata["personalAccessTokenFromEnv"]; ok && val != "" {
@@ -203,6 +217,15 @@ func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (stri
 			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("pod identity %s not supported for azure pipelines", config.PodIdentity.Provider)
 		}
 	}
+
+	if clientID != "" && clientSecret != "" && tenantID != "" {
+		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
+		if err != nil {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("error creating service principal credential: %w", err)
+		}
+		return "", cred, kedav1alpha1.AuthPodIdentity{}, nil
+	}
+
 	return pat, nil, kedav1alpha1.AuthPodIdentity{}, nil
 }
 
@@ -248,7 +271,6 @@ func parseAzurePipelinesMetadata(ctx context.Context, logger logr.Logger, config
 	if err != nil {
 		return nil, kedav1alpha1.AuthPodIdentity{}, err
 	}
-	// Trim any trailing new lines from the Azure Pipelines PAT
 	meta.authContext = authContext{
 		pat:   strings.TrimSuffix(pat, "\n"),
 		cred:  cred,
@@ -286,23 +308,20 @@ func parseAzurePipelinesMetadata(ctx context.Context, logger logr.Logger, config
 	}
 
 	if val, ok := config.TriggerMetadata["poolName"]; ok && val != "" {
+		poolName := val
 		var err error
-		poolID, err := getPoolIDFromName(ctx, logger, val, &meta, podIdentity, httpClient)
+		meta.poolID, err = getPoolIDFromName(ctx, logger, poolName, &meta, podIdentity, httpClient)
 		if err != nil {
 			return nil, kedav1alpha1.AuthPodIdentity{}, err
 		}
-		meta.poolID = poolID
-	} else {
-		if val, ok := config.TriggerMetadata["poolID"]; ok && val != "" {
-			var err error
-			poolID, err := validatePoolID(ctx, logger, val, &meta, podIdentity, httpClient)
-			if err != nil {
-				return nil, kedav1alpha1.AuthPodIdentity{}, err
-			}
-			meta.poolID = poolID
-		} else {
-			return nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("no poolName or poolID given")
+	} else if val, ok := config.TriggerMetadata["poolID"]; ok && val != "" {
+		var err error
+		meta.poolID, err = validatePoolID(ctx, logger, val, &meta, podIdentity, httpClient)
+		if err != nil {
+			return nil, kedav1alpha1.AuthPodIdentity{}, err
 		}
+	} else {
+		return nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("no poolName or poolID given")
 	}
 
 	meta.triggerIndex = config.TriggerIndex
@@ -354,16 +373,16 @@ func validatePoolID(ctx context.Context, logger logr.Logger, poolID string, meta
 }
 
 func getToken(ctx context.Context, metadata *azurePipelinesMetadata, scope string) (string, error) {
-	if metadata.authContext.token != nil {
-		//if token expires after more then minute from now let's reuse
-		if metadata.authContext.token.ExpiresOn.After(time.Now().Add(time.Second * 60)) {
-			return metadata.authContext.token.Token, nil
-		}
+	if metadata.authContext.token != nil && metadata.authContext.token.ExpiresOn.After(time.Now().Add(time.Second*60)) {
+		return metadata.authContext.token.Token, nil
 	}
+
+	if metadata.authContext.cred == nil {
+		return "", fmt.Errorf("no credential available")
+	}
+
 	token, err := metadata.authContext.cred.GetToken(ctx, policy.TokenRequestOptions{
-		Scopes: []string{
-			scope,
-		},
+		Scopes: []string{scope},
 	})
 
 	if err != nil {
@@ -381,12 +400,16 @@ func getAzurePipelineRequest(ctx context.Context, logger logr.Logger, urlString 
 		return []byte{}, err
 	}
 
-	switch podIdentity.Provider {
-	case "", kedav1alpha1.PodIdentityProviderNone:
-		//PAT
-		logger.V(1).Info("making request to ADO REST API using PAT")
+	if metadata.authContext.cred != nil {
+		token, err := getToken(ctx, metadata, devopsResource)
+		if err != nil {
+			logger.Error(err, "Error getting token")
+			return nil, fmt.Errorf("error getting token: %w", err)
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	} else if metadata.authContext.pat != "" {
 		req.SetBasicAuth("", metadata.authContext.pat)
-	case kedav1alpha1.PodIdentityProviderAzureWorkload:
+	} else {
 		//ADO Resource token
 		logger.V(1).Info("making request to ADO REST API using managed identity")
 		aadToken, err := getToken(ctx, metadata, devopsResource)
