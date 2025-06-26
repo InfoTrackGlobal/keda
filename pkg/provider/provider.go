@@ -35,12 +35,9 @@ import (
 type KedaProvider struct {
 	defaults.DefaultExternalMetricsProvider
 
-	client           client.Client
-	watchedNamespace string
-	ctx              context.Context
+	client client.Client
 
-	grpcClient            metricsservice.GrpcClient
-	useMetricsServiceGrpc bool
+	grpcClient metricsservice.GrpcClient
 }
 
 var (
@@ -50,13 +47,10 @@ var (
 )
 
 // NewProvider returns an instance of KedaProvider
-func NewProvider(ctx context.Context, adapterLogger logr.Logger, client client.Client, grpcClient metricsservice.GrpcClient, useMetricsServiceGrpc bool, watchedNamespace string) provider.ExternalMetricsProvider {
+func NewProvider(ctx context.Context, adapterLogger logr.Logger, client client.Client, grpcClient metricsservice.GrpcClient) provider.ExternalMetricsProvider {
 	provider := &KedaProvider{
-		client:                client,
-		watchedNamespace:      watchedNamespace,
-		ctx:                   ctx,
-		grpcClient:            grpcClient,
-		useMetricsServiceGrpc: useMetricsServiceGrpc,
+		client:     client,
+		grpcClient: grpcClient,
 	}
 	logger = adapterLogger.WithName("provider")
 	logger.Info("starting")
@@ -92,7 +86,8 @@ func (p *KedaProvider) GetExternalMetric(ctx context.Context, namespace string, 
 	// Get Metrics from Metrics Service gRPC Server
 	if !p.grpcClient.WaitForConnectionReady(ctx, logger) {
 		grpcClientConnected = false
-		logger.Error(fmt.Errorf("timeout while waiting to establish gRPC connection to KEDA Metrics Service server"), "timeout", "server", p.grpcClient.GetServerURL())
+		err := fmt.Errorf("timeout while waiting to establish gRPC connection to KEDA Metrics Service server")
+		logger.Error(err, "timeout", "server", p.grpcClient.GetServerURL())
 		return nil, err
 	}
 	if !grpcClientConnected {

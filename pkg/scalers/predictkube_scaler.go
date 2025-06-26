@@ -28,6 +28,7 @@ import (
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -91,7 +92,7 @@ type predictKubeMetadata struct {
 	query               string
 	threshold           float64
 	activationThreshold float64
-	scalerIndex         int
+	triggerIndex        int
 }
 
 func (s *PredictKubeScaler) setupClientConn() error {
@@ -123,7 +124,7 @@ func (s *PredictKubeScaler) setupClientConn() error {
 		return err
 	}
 
-	connection, err := grpc.Dial(net.JoinHostPort(mlEngineHost, fmt.Sprintf("%d", mlEnginePort)), clientOpt...)
+	connection, err := grpc.NewClient(net.JoinHostPort(mlEngineHost, fmt.Sprintf("%d", mlEnginePort)), clientOpt...)
 	if err != nil {
 		return err
 	}
@@ -136,7 +137,7 @@ func (s *PredictKubeScaler) setupClientConn() error {
 }
 
 // NewPredictKubeScaler creates a new PredictKube scaler
-func NewPredictKubeScaler(ctx context.Context, config *ScalerConfig) (*PredictKubeScaler, error) {
+func NewPredictKubeScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (*PredictKubeScaler, error) {
 	s := &PredictKubeScaler{}
 
 	logger := InitializeLogger(config, "predictkube_scaler")
@@ -183,7 +184,7 @@ func (s *PredictKubeScaler) GetMetricSpecForScaling(context.Context) []v2.Metric
 	metricName := kedautil.NormalizeString(fmt.Sprintf("predictkube-%s", predictKubeMetricPrefix))
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, metricName),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, metricName),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.threshold),
 	}
@@ -271,7 +272,7 @@ func (s *PredictKubeScaler) doQuery(ctx context.Context) ([]*commonproto.Item, e
 
 // parsePrometheusResult parsing response from prometheus server.
 func (s *PredictKubeScaler) parsePrometheusResult(result model.Value) (out []*commonproto.Item, err error) {
-	metricName := GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("predictkube-%s", predictKubeMetricPrefix)))
+	metricName := GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("predictkube-%s", predictKubeMetricPrefix)))
 	switch result.Type() {
 	case model.ValVector:
 		if res, ok := result.(model.Vector); ok {
@@ -343,7 +344,7 @@ func (s *PredictKubeScaler) parsePrometheusResult(result model.Value) (out []*co
 	return out, nil
 }
 
-func parsePredictKubeMetadata(config *ScalerConfig) (result *predictKubeMetadata, err error) {
+func parsePredictKubeMetadata(config *scalersconfig.ScalerConfig) (result *predictKubeMetadata, err error) {
 	validate := validator.New()
 	meta := predictKubeMetadata{}
 
@@ -405,7 +406,11 @@ func parsePredictKubeMetadata(config *ScalerConfig) (result *predictKubeMetadata
 		}
 		meta.threshold = threshold
 	} else {
-		return nil, fmt.Errorf("no threshold given")
+		if config.AsMetricSource {
+			meta.threshold = 0
+		} else {
+			return nil, fmt.Errorf("no threshold given")
+		}
 	}
 
 	meta.activationThreshold = 0
@@ -417,7 +422,7 @@ func parsePredictKubeMetadata(config *ScalerConfig) (result *predictKubeMetadata
 		meta.activationThreshold = activationThreshold
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	if val, ok := config.AuthParams["apiKey"]; ok {
 		err = validate.Var(val, "jwt")

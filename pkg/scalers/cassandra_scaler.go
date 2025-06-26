@@ -2,8 +2,10 @@ package scalers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 
@@ -12,6 +14,7 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -27,6 +30,10 @@ type cassandraScaler struct {
 type CassandraMetadata struct {
 	username                   string
 	password                   string
+	enableTLS                  bool
+	cert                       string
+	key                        string
+	ca                         string
 	clusterIPAddress           string
 	port                       int
 	consistency                gocql.Consistency
@@ -35,11 +42,16 @@ type CassandraMetadata struct {
 	query                      string
 	targetQueryValue           int64
 	activationTargetQueryValue int64
-	scalerIndex                int
+	triggerIndex               int
 }
 
+const (
+	tlsEnable  = "enable"
+	tlsDisable = "disable"
+)
+
 // NewCassandraScaler creates a new Cassandra scaler.
-func NewCassandraScaler(config *ScalerConfig) (Scaler, error) {
+func NewCassandraScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -66,8 +78,9 @@ func NewCassandraScaler(config *ScalerConfig) (Scaler, error) {
 }
 
 // parseCassandraMetadata parses the metadata and returns a CassandraMetadata or an error if the ScalerConfig is invalid.
-func parseCassandraMetadata(config *ScalerConfig) (*CassandraMetadata, error) {
-	meta := CassandraMetadata{}
+func parseCassandraMetadata(config *scalersconfig.ScalerConfig) (*CassandraMetadata, error) {
+	meta := &CassandraMetadata{}
+	var err error
 
 	if val, ok := config.TriggerMetadata["query"]; ok {
 		meta.query = val
@@ -82,7 +95,11 @@ func parseCassandraMetadata(config *ScalerConfig) (*CassandraMetadata, error) {
 		}
 		meta.targetQueryValue = targetQueryValue
 	} else {
-		return nil, fmt.Errorf("no targetQueryValue given")
+		if config.AsMetricSource {
+			meta.targetQueryValue = 0
+		} else {
+			return nil, fmt.Errorf("no targetQueryValue given")
+		}
 	}
 
 	meta.activationTargetQueryValue = 0
@@ -152,9 +169,86 @@ func parseCassandraMetadata(config *ScalerConfig) (*CassandraMetadata, error) {
 		return nil, fmt.Errorf("no password given")
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	if err = parseCassandraTLS(config, meta); err != nil {
+		return meta, err
+	}
 
-	return &meta, nil
+	meta.triggerIndex = config.TriggerIndex
+
+	return meta, nil
+}
+
+func createTempFile(prefix string, content string) (string, error) {
+	tempCassandraDir := fmt.Sprintf("%s%c%s", os.TempDir(), os.PathSeparator, "cassandra")
+	err := os.MkdirAll(tempCassandraDir, 0700)
+	if err != nil {
+		return "", fmt.Errorf(`error creating temporary directory: %s.  Error: %w
+		Note, when running in a container a writable /tmp/cassandra emptyDir must be mounted.  Refer to documentation`, tempCassandraDir, err)
+	}
+
+	f, err := os.CreateTemp(tempCassandraDir, prefix+"-*.pem")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(content)
+	if err != nil {
+		return "", err
+	}
+
+	return f.Name(), nil
+}
+
+func parseCassandraTLS(config *scalersconfig.ScalerConfig, meta *CassandraMetadata) error {
+	meta.enableTLS = false
+	if val, ok := config.AuthParams["tls"]; ok {
+		val = strings.TrimSpace(val)
+		if val == tlsEnable {
+			certGiven := config.AuthParams["cert"] != ""
+			keyGiven := config.AuthParams["key"] != ""
+			caCertGiven := config.AuthParams["ca"] != ""
+			if certGiven && !keyGiven {
+				return errors.New("no key given")
+			}
+			if keyGiven && !certGiven {
+				return errors.New("no cert given")
+			}
+			if !keyGiven && !certGiven {
+				return errors.New("no cert/key given")
+			}
+
+			certFilePath, err := createTempFile("cert", config.AuthParams["cert"])
+			if err != nil {
+				// handle error
+				return errors.New("Error creating cert file: " + err.Error())
+			}
+
+			keyFilePath, err := createTempFile("key", config.AuthParams["key"])
+			if err != nil {
+				// handle error
+				return errors.New("Error creating key file: " + err.Error())
+			}
+
+			meta.cert = certFilePath
+			meta.key = keyFilePath
+			meta.ca = config.AuthParams["ca"]
+			if !caCertGiven {
+				meta.ca = ""
+			} else {
+				caCertFilePath, err := createTempFile("caCert", config.AuthParams["ca"])
+				meta.ca = caCertFilePath
+				if err != nil {
+					// handle error
+					return errors.New("Error creating ca file: " + err.Error())
+				}
+			}
+			meta.enableTLS = true
+		} else if val != tlsDisable {
+			return fmt.Errorf("err incorrect value for TLS given: %s", val)
+		}
+	}
+	return nil
 }
 
 // newCassandraSession returns a new Cassandra session for the provided CassandraMetadata.
@@ -165,6 +259,14 @@ func newCassandraSession(meta *CassandraMetadata, logger logr.Logger) (*gocql.Se
 	cluster.Authenticator = gocql.PasswordAuthenticator{
 		Username: meta.username,
 		Password: meta.password,
+	}
+
+	if meta.enableTLS {
+		cluster.SslOpts = &gocql.SslOptions{
+			CertPath: meta.cert,
+			KeyPath:  meta.key,
+			CaPath:   meta.ca,
+		}
 	}
 
 	session, err := cluster.CreateSession()
@@ -180,7 +282,7 @@ func newCassandraSession(meta *CassandraMetadata, logger logr.Logger) (*gocql.Se
 func (s *cassandraScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("cassandra-%s", s.metadata.keyspace))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("cassandra-%s", s.metadata.keyspace))),
 		},
 		Target: GetMetricTarget(s.metricType, s.metadata.targetQueryValue),
 	}
@@ -218,7 +320,25 @@ func (s *cassandraScaler) GetQueryResult(ctx context.Context) (int64, error) {
 
 // Close closes the Cassandra session connection.
 func (s *cassandraScaler) Close(_ context.Context) error {
-	s.session.Close()
+	// clean up any temporary files
+	if strings.TrimSpace(s.metadata.cert) != "" {
+		if err := os.Remove(s.metadata.cert); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(s.metadata.key) != "" {
+		if err := os.Remove(s.metadata.key); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(s.metadata.ca) != "" {
+		if err := os.Remove(s.metadata.ca); err != nil {
+			return err
+		}
+	}
 
+	if s.session != nil {
+		s.session.Close()
+	}
 	return nil
 }

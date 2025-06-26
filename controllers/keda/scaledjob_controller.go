@@ -19,6 +19,7 @@ package keda
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -41,9 +42,10 @@ import (
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	kedacontrollerutil "github.com/kedacore/keda/v2/controllers/keda/util"
 	"github.com/kedacore/keda/v2/pkg/eventreason"
-	"github.com/kedacore/keda/v2/pkg/prommetrics"
+	"github.com/kedacore/keda/v2/pkg/metricscollector"
 	"github.com/kedacore/keda/v2/pkg/scaling"
 	kedastatus "github.com/kedacore/keda/v2/pkg/status"
+	"github.com/kedacore/keda/v2/pkg/util"
 )
 
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledjobs;scaledjobs/finalizers;scaledjobs/status,verbs="*"
@@ -90,6 +92,7 @@ func (r *ScaledJobReconciler) SetupWithManager(mgr ctrl.Manager, options control
 				kedacontrollerutil.PausedPredicate{},
 				predicate.GenerationChangedPredicate{},
 			))).
+		WithEventFilter(util.IgnoreOtherNamespaces()).
 		Complete(r)
 }
 
@@ -181,6 +184,11 @@ func (r *ScaledJobReconciler) reconcileScaledJob(ctx context.Context, logger log
 		return "ScaledJob is paused, skipping reconcile loop", err
 	}
 
+	err = kedav1alpha1.ValidateTriggers(scaledJob.Spec.Triggers)
+	if err != nil {
+		return "ScaledJob doesn't have correct triggers specification", err
+	}
+
 	// nosemgrep: trailofbits.go.invalid-usage-of-modified-variable.invalid-usage-of-modified-variable
 	msg, err := r.deletePreviousVersionScaleJobs(ctx, logger, scaledJob)
 	if err != nil {
@@ -216,9 +224,17 @@ func (r *ScaledJobReconciler) reconcileScaledJob(ctx context.Context, logger log
 
 // checkIfPaused checks the presence of "autoscaling.keda.sh/paused" annotation on the scaledJob and stop the scale loop.
 func (r *ScaledJobReconciler) checkIfPaused(ctx context.Context, logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob, conditions *kedav1alpha1.Conditions) (bool, error) {
-	_, pausedAnnotation := scaledJob.GetAnnotations()[kedacontrollerutil.PausedAnnotation]
+	pausedAnnotationValue, pausedAnnotation := scaledJob.GetAnnotations()[kedav1alpha1.PausedAnnotation]
 	pausedStatus := conditions.GetPausedCondition().Status == metav1.ConditionTrue
+	shouldPause := false
 	if pausedAnnotation {
+		var err error
+		shouldPause, err = strconv.ParseBool(pausedAnnotationValue)
+		if err != nil {
+			shouldPause = true
+		}
+	}
+	if shouldPause {
 		if !pausedStatus {
 			logger.Info("ScaledJob is paused, stopping scaling loop.")
 			msg := kedav1alpha1.ScaledJobConditionPausedMessage
@@ -263,22 +279,36 @@ func (r *ScaledJobReconciler) deletePreviousVersionScaleJobs(ctx context.Context
 			return "Cannot get list of Jobs owned by this scaledJob", err
 		}
 
-		if len(jobs.Items) > 0 {
-			logger.Info("RolloutStrategy: immediate, Deleting jobs owned by the previous version of the scaledJob", "numJobsToDelete", len(jobs.Items))
+		jobIndexes := make([]int, 0, len(jobs.Items))
+		scaledJobGeneration := strconv.FormatInt(scaledJob.Generation, 10)
+		for i, job := range jobs.Items {
+			if jobGen, ok := job.Annotations["scaledjob.keda.sh/generation"]; !ok {
+				// delete Jobs that don't have the generation annotation
+				jobIndexes = append(jobIndexes, i)
+			} else if jobGen != scaledJobGeneration {
+				// delete Jobs that have a different generation annotation
+				jobIndexes = append(jobIndexes, i)
+			}
 		}
-		for _, job := range jobs.Items {
-			job := job
 
-			propagationPolicy := metav1.DeletePropagationBackground
-			if scaledJob.Spec.Rollout.PropagationPolicy == "foreground" {
-				propagationPolicy = metav1.DeletePropagationForeground
+		if len(jobIndexes) == 0 {
+			logger.Info("RolloutStrategy: immediate, No jobs owned by the previous version of the scaledJob")
+		} else {
+			logger.Info("RolloutStrategy: immediate, Deleting jobs owned by the previous version of the scaledJob", "numJobsToDelete", len(jobIndexes))
+			for _, index := range jobIndexes {
+				job := jobs.Items[index]
+
+				propagationPolicy := metav1.DeletePropagationBackground
+				if scaledJob.Spec.Rollout.PropagationPolicy == "foreground" {
+					propagationPolicy = metav1.DeletePropagationForeground
+				}
+				err = r.Client.Delete(ctx, &job, client.PropagationPolicy(propagationPolicy))
+				if err != nil {
+					return "Not able to delete job: " + job.Name, err
+				}
 			}
-			err = r.Client.Delete(ctx, &job, client.PropagationPolicy(propagationPolicy))
-			if err != nil {
-				return "Not able to delete job: " + job.Name, err
-			}
+			return fmt.Sprintf("RolloutStrategy: immediate, deleted jobs owned by the previous version of the scaleJob: %d jobs deleted", len(jobIndexes)), nil
 		}
-		return fmt.Sprintf("RolloutStrategy: immediate, deleted jobs owned by the previous version of the scaleJob: %d jobs deleted", len(jobs.Items)), nil
 	}
 	return fmt.Sprintf("RolloutStrategy: %s", scaledJob.Spec.RolloutStrategy), nil
 }
@@ -286,7 +316,6 @@ func (r *ScaledJobReconciler) deletePreviousVersionScaleJobs(ctx context.Context
 // requestScaleLoop request ScaleLoop handler for the respective ScaledJob
 func (r *ScaledJobReconciler) requestScaleLoop(ctx context.Context, logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob) error {
 	logger.V(1).Info("Starting a new ScaleLoop")
-
 	key, err := cache.MetaNamespaceKeyFunc(scaledJob)
 	if err != nil {
 		logger.Error(err, "Error getting key for scaledJob")
@@ -327,18 +356,18 @@ func (r *ScaledJobReconciler) updatePromMetrics(scaledJob *kedav1alpha1.ScaledJo
 	metricsData, ok := scaledJobPromMetricsMap[namespacedName]
 
 	if ok {
-		prommetrics.DecrementCRDTotal(prommetrics.ScaledJobResource, metricsData.namespace)
+		metricscollector.DecrementCRDTotal(metricscollector.ScaledJobResource, metricsData.namespace)
 		for _, triggerType := range metricsData.triggerTypes {
-			prommetrics.DecrementTriggerTotal(triggerType)
+			metricscollector.DecrementTriggerTotal(triggerType)
 		}
 	}
 
-	prommetrics.IncrementCRDTotal(prommetrics.ScaledJobResource, scaledJob.Namespace)
+	metricscollector.IncrementCRDTotal(metricscollector.ScaledJobResource, scaledJob.Namespace)
 	metricsData.namespace = scaledJob.Namespace
 
 	triggerTypes := make([]string, len(scaledJob.Spec.Triggers))
 	for _, trigger := range scaledJob.Spec.Triggers {
-		prommetrics.IncrementTriggerTotal(trigger.Type)
+		metricscollector.IncrementTriggerTotal(trigger.Type)
 		triggerTypes = append(triggerTypes, trigger.Type)
 	}
 	metricsData.triggerTypes = triggerTypes
@@ -351,9 +380,9 @@ func (r *ScaledJobReconciler) updatePromMetricsOnDelete(namespacedName string) {
 	defer scaledJobPromMetricsLock.Unlock()
 
 	if metricsData, ok := scaledJobPromMetricsMap[namespacedName]; ok {
-		prommetrics.DecrementCRDTotal(prommetrics.ScaledJobResource, metricsData.namespace)
+		metricscollector.DecrementCRDTotal(metricscollector.ScaledJobResource, metricsData.namespace)
 		for _, triggerType := range metricsData.triggerTypes {
-			prommetrics.DecrementTriggerTotal(triggerType)
+			metricscollector.DecrementTriggerTotal(triggerType)
 		}
 	}
 

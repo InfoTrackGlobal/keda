@@ -6,6 +6,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 
@@ -123,7 +124,7 @@ func TestSetupAwsIdentityComponents(t *testing.T) {
 	KubeClient = GetKubernetesClient(t)
 	CreateNamespace(t, KubeClient, AwsIdentityNamespace)
 
-	_, err = ExecuteCommand(fmt.Sprintf("helm upgrade --install aws-identity-webhook jkroepke/amazon-eks-pod-identity-webhook --namespace %s --set fullnameOverride=aws-identity-webhook",
+	_, err = ExecuteCommand(fmt.Sprintf("helm upgrade --install aws-identity-webhook jkroepke/amazon-eks-pod-identity-webhook --namespace %s --set config.defaultAwsRegion=eu-west-2 --set fullnameOverride=aws-identity-webhook",
 		AwsIdentityNamespace))
 	require.NoErrorf(t, err, "cannot install workload identity webhook - %s", err)
 }
@@ -167,7 +168,46 @@ func TesVerifyPodsIdentity(t *testing.T) {
 	}
 }
 
+func TestSetupOpentelemetryComponents(t *testing.T) {
+	if EnableOpentelemetry == "" || EnableOpentelemetry == StringFalse {
+		t.Skip("skipping installing opentelemetry")
+	}
+
+	otlpTempFileName := "otlp.yml"
+	otlpServiceTempFileName := "otlpServicePatch.yml"
+	defer os.Remove(otlpTempFileName)
+	defer os.Remove(otlpServiceTempFileName)
+	err := os.WriteFile(otlpTempFileName, []byte(helper.OtlpConfig), 0755)
+	assert.NoErrorf(t, err, "cannot create otlp config file - %s", err)
+
+	err = os.WriteFile(otlpServiceTempFileName, []byte(helper.OtlpServicePatch), 0755)
+	assert.NoErrorf(t, err, "cannot create otlp service patch file - %s", err)
+
+	_, err = ExecuteCommand("helm version")
+	require.NoErrorf(t, err, "helm is not installed - %s", err)
+
+	_, err = ExecuteCommand("helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts")
+	require.NoErrorf(t, err, "cannot add open-telemetry helm repo - %s", err)
+
+	_, err = ExecuteCommand("helm repo update open-telemetry")
+	require.NoErrorf(t, err, "cannot update open-telemetry helm repo - %s", err)
+
+	KubeClient = GetKubernetesClient(t)
+	CreateNamespace(t, KubeClient, OpentelemetryNamespace)
+
+	_, err = ExecuteCommand(fmt.Sprintf("helm upgrade --install opentelemetry-collector open-telemetry/opentelemetry-collector -f %s --namespace %s", otlpTempFileName, OpentelemetryNamespace))
+
+	require.NoErrorf(t, err, "cannot install opentelemetry - %s", err)
+
+	_, err = ExecuteCommand(fmt.Sprintf("kubectl apply -f %s -n %s", otlpServiceTempFileName, OpentelemetryNamespace))
+	require.NoErrorf(t, err, "cannot update opentelemetry ports - %s", err)
+}
+
 func TestDeployKEDA(t *testing.T) {
+	// default to true
+	if InstallKeda == StringFalse {
+		t.Skip("skipping as requested -- KEDA assumed to be already installed")
+	}
 	KubeClient = GetKubernetesClient(t)
 	CreateNamespace(t, KubeClient, KEDANamespace)
 
@@ -193,6 +233,10 @@ func TestDeployKEDA(t *testing.T) {
 }
 
 func TestVerifyKEDA(t *testing.T) {
+	// default to true
+	if InstallKeda == StringFalse {
+		t.Skip("skipping as requested -- KEDA assumed to be already installed")
+	}
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, KubeClient, KEDAOperator, KEDANamespace, 1, 30, 6),
 		"replica count should be 1 after 3 minutes")
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, KubeClient, KEDAMetricsAPIServer, KEDANamespace, 1, 30, 6),
@@ -201,32 +245,26 @@ func TestVerifyKEDA(t *testing.T) {
 		"replica count should be 1 after 3 minutes")
 }
 
-func TestSetupAadPodIdentityComponents(t *testing.T) {
-	if AzureRunAadPodIdentityTests == "" || AzureRunAadPodIdentityTests == StringFalse {
-		t.Skip("skipping as aad pod identity tests are disabled")
+func TestSetUpStrimzi(t *testing.T) {
+	// default to true
+	if InstallKafka == StringFalse {
+		t.Skip("skipping as requested -- Kafka assumed to be unneeded or already installed")
 	}
-
-	_, err := ExecuteCommand("helm version")
-	require.NoErrorf(t, err, "helm is not installed - %s", err)
-
-	_, err = ExecuteCommand("helm repo add aad-pod-identity https://raw.githubusercontent.com/Azure/aad-pod-identity/master/charts")
-	require.NoErrorf(t, err, "cannot add pod identity helm repo - %s", err)
-
-	_, err = ExecuteCommand("helm repo update aad-pod-identity")
-	require.NoErrorf(t, err, "cannot update aad pod identity helm repo - %s", err)
+	t.Log("--- installing kafka operator ---")
+	_, err := ExecuteCommand("helm repo add strimzi https://strimzi.io/charts/")
+	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	_, err = ExecuteCommand("helm repo update")
+	assert.NoErrorf(t, err, "cannot execute command - %s", err)
 
 	KubeClient = GetKubernetesClient(t)
-	CreateNamespace(t, KubeClient, AzureAdPodIdentityNamespace)
 
-	_, err = ExecuteCommand(fmt.Sprintf("helm upgrade --install "+
-		"aad-pod-identity aad-pod-identity/aad-pod-identity "+
-		"--namespace %s --wait "+
-		"--set azureIdentities.keda.type=0 "+
-		"--set azureIdentities.keda.namespace=keda "+
-		"--set azureIdentities.keda.clientID=%s "+
-		"--set azureIdentities.keda.resourceID=%s "+
-		"--set azureIdentities.keda.binding.selector=keda "+
-		"--set azureIdentities.keda.binding.name=keda",
-		AzureAdPodIdentityNamespace, AzureADMsiClientID, AzureADMsiID))
-	require.NoErrorf(t, err, "cannot install aad pod identity webhook - %s", err)
+	CreateNamespace(t, KubeClient, StrimziNamespace)
+
+	_, err = ExecuteCommand(fmt.Sprintf(`helm upgrade --install --namespace %s --wait %s strimzi/strimzi-kafka-operator --version %s --set watchAnyNamespace=true`,
+		StrimziNamespace,
+		StrimziChartName,
+		StrimziVersion))
+	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+
+	t.Log("--- kafka operator installed ---")
 }

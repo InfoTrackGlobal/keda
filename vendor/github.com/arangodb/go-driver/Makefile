@@ -1,12 +1,10 @@
-DRIVER_VERSION := 1.6.0
-
 PROJECT := go-driver
 SCRIPTDIR := $(shell pwd)
 
 CURR=$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 ROOTDIR:=$(CURR)
 
-GOVERSION ?= 1.20.3
+GOVERSION ?= 1.21.8
 GOIMAGE ?= golang:$(GOVERSION)
 GOV2IMAGE ?= $(GOIMAGE)
 ALPINE_IMAGE ?= alpine:3.17
@@ -33,6 +31,15 @@ ifdef RACE
 	CGO_ENABLED=1
 endif
 
+ifndef AF_ENABLED
+	AF_ENABLED := "false"
+endif
+
+ifndef VST_ENABLED
+	VST_ENABLED := "false"
+endif
+
+TESTV2PARALLEL ?= 1
 
 ORGPATH := github.com/arangodb
 REPONAME := $(PROJECT)
@@ -139,7 +146,7 @@ ifeq ("$(DEBUG)", "true")
 	DOCKER_V2_RUN_CMD := $(DOCKER_RUN_CMD)
 else
     DOCKER_RUN_CMD := $(GOIMAGE) go test -timeout 120m $(GOBUILDTAGSOPT) $(TESTOPTIONS) $(TESTVERBOSEOPTIONS) $(TESTS)
-    DOCKER_V2_RUN_CMD := $(GOV2IMAGE) go test -timeout 120m $(GOBUILDTAGSOPT) $(TESTOPTIONS) $(TESTVERBOSEOPTIONS) ./tests
+    DOCKER_V2_RUN_CMD := $(GOV2IMAGE) go test -timeout 120m $(GOBUILDTAGSOPT) $(TESTOPTIONS) $(TESTVERBOSEOPTIONS) -parallel $(TESTV2PARALLEL) ./tests
 endif
 
 .PHONY: all build clean linter run-tests vulncheck
@@ -163,7 +170,10 @@ changelog:
 		--no-author \
 		--unreleased-label "Master"
 
-run-tests: run-unit-tests run-tests-single run-tests-resilientsingle run-tests-cluster
+run-tests: run-unit-tests run-tests-single run-tests-cluster
+ifeq ("$(AF_ENABLED)", "true")
+	make run-tests-resilientsingle
+endif
 
 # The below rule exists only for backward compatibility.
 run-tests-http: run-unit-tests
@@ -175,7 +185,7 @@ run-unit-tests: run-v2-unit-tests
 		-e CGO_ENABLED=$(CGO_ENABLED) \
 		-w /usr/code/ \
 		$(GOIMAGE) \
-		go test $(TESTOPTIONS) $(REPOPATH)/http $(REPOPATH)/agency $(REPOPATH)/vst/protocol
+		go test $(TESTOPTIONS) $(REPOPATH) $(REPOPATH)/http $(REPOPATH)/agency $(REPOPATH)/vst/protocol
 
 run-v2-unit-tests:
 	@$(DOCKER_CMD) \
@@ -187,7 +197,10 @@ run-v2-unit-tests:
 		go test $(TESTOPTIONS) $(REPOPATH)/v2/connection $(REPOPATH)/v2/arangodb/...
 
 # Single server tests 
-run-tests-single: run-tests-single-json run-tests-single-vpack run-tests-single-vst-1.0 $(VST11_SINGLE_TESTS)
+run-tests-single: run-tests-single-json run-tests-single-vpack
+ifeq ("$(VST_ENABLED)", "true")
+	make run-tests-single-vst-1.0 $(VST11_SINGLE_TESTS)
+endif
 
 run-tests-single-json: run-tests-single-json-with-auth run-tests-single-json-no-auth run-tests-single-json-jwt-super run-tests-single-json-ssl
 
@@ -262,7 +275,10 @@ run-tests-single-vst-1.1-jwt-ssl:
 	@${MAKE} TEST_MODE="single" TEST_AUTH="jwt" TEST_SSL="auto" TEST_CONNECTION="vst" TEST_CVERSION="1.1" __run_tests
 
 # ResilientSingle server tests 
-run-tests-resilientsingle: run-tests-resilientsingle-json run-tests-resilientsingle-vpack run-tests-resilientsingle-vst-1.0 $(VST11_RESILIENTSINGLE_TESTS)
+run-tests-resilientsingle: run-tests-resilientsingle-json run-tests-resilientsingle-vpack
+ifeq ("$(VST_ENABLED)", "true")
+	make run-tests-resilientsingle-vst-1.0 $(VST11_RESILIENTSINGLE_TESTS)
+endif
 
 run-tests-resilientsingle-json: run-tests-resilientsingle-json-with-auth run-tests-resilientsingle-json-no-auth
 
@@ -309,7 +325,11 @@ run-tests-resilientsingle-vst-1.1-jwt-auth:
 	@${MAKE} TEST_MODE="resilientsingle" TEST_AUTH="jwt" TEST_CONNECTION="vst" TEST_CVERSION="1.1" __run_tests
 
 # Cluster mode tests
-run-tests-cluster: run-tests-cluster-json run-tests-cluster-vpack run-tests-cluster-vst-1.0 $(VST11_CLUSTER_TESTS)
+run-tests-cluster: run-tests-cluster-json run-tests-cluster-vpack
+ifeq ("$(VST_ENABLED)", "true")
+	make run-tests-cluster-vst-1.0 $(VST11_CLUSTER_TESTS)
+endif
+
 
 run-tests-cluster-json: run-tests-cluster-json-no-auth run-tests-cluster-json-with-auth run-tests-cluster-json-ssl
 
@@ -394,6 +414,7 @@ __test_go_test:
 		-e TEST_ENABLE_SHUTDOWN=$(TEST_ENABLE_SHUTDOWN) \
 		-e TEST_REQUEST_LOG=$(TEST_REQUEST_LOG) \
 		-e TEST_DISALLOW_UNKNOWN_FIELDS=$(TEST_DISALLOW_UNKNOWN_FIELDS) \
+		-e ENABLE_DATABASE_EXTRA_FEATURES=$(ENABLE_DATABASE_EXTRA_FEATURES) \
 		-e GODEBUG=tls13=1 \
 		-e CGO_ENABLED=$(CGO_ENABLED) \
 		-w /usr/code/ \
@@ -421,6 +442,7 @@ __test_v2_go_test:
 		-e TEST_BACKUP_REMOTE_CONFIG='$(TEST_BACKUP_REMOTE_CONFIG)' \
 		-e TEST_DEBUG='$(TEST_DEBUG)' \
 		-e TEST_ENABLE_SHUTDOWN=$(TEST_ENABLE_SHUTDOWN) \
+		-e ENABLE_DATABASE_EXTRA_FEATURES=$(ENABLE_DATABASE_EXTRA_FEATURES) \
 		-e GODEBUG=tls13=1 \
 		-e CGO_ENABLED=$(CGO_ENABLED) \
 		-w /usr/code/v2/ \
@@ -455,7 +477,9 @@ ifdef JWTSECRET
 	echo "$JWTSECRET" > "${JWTSECRETFILE}"
 endif
 	@-docker rm -f -v $(TESTCONTAINER) &> /dev/null
-	@TESTCONTAINER=$(TESTCONTAINER) ARANGODB=$(ARANGODB) ALPINE_IMAGE=$(ALPINE_IMAGE) ENABLE_BACKUP=$(ENABLE_BACKUP) ARANGO_LICENSE_KEY=$(ARANGO_LICENSE_KEY) STARTER=$(STARTER) STARTERMODE=$(TEST_MODE) TMPDIR="${TMPDIR}" DEBUG_PORT=$(DEBUG_PORT) $(CLUSTERENV) "${ROOTDIR}/test/cluster.sh" start
+	@TESTCONTAINER=$(TESTCONTAINER) ARANGODB=$(ARANGODB) ALPINE_IMAGE=$(ALPINE_IMAGE) ENABLE_BACKUP=$(ENABLE_BACKUP) \
+	  ARANGO_LICENSE_KEY=$(ARANGO_LICENSE_KEY) STARTER=$(STARTER) STARTERMODE=$(TEST_MODE) TMPDIR="${TMPDIR}" \
+	  ENABLE_DATABASE_EXTRA_FEATURES=$(ENABLE_DATABASE_EXTRA_FEATURES) DEBUG_PORT=$(DEBUG_PORT) $(CLUSTERENV) "${ROOTDIR}/test/cluster.sh" start
 endif
 
 __test_cleanup:
@@ -491,6 +515,8 @@ tools: __dir_setup
 	@GOBIN=$(TMPDIR)/bin go install github.com/google/addlicense@v1.0.0
 	@echo ">> Fetching govulncheck"
 	@GOBIN=$(TMPDIR)/bin go install golang.org/x/vuln/cmd/govulncheck@v0.1.0
+	@echo ">> Fetching github-release"
+	@GOBIN=$(TMPDIR)/bin go install github.com/github-release/github-release@v0.10.0
 
 .PHONY: license
 license:
@@ -525,7 +551,10 @@ vulncheck:
 v2-%:
 	@(cd "$(ROOTDIR)/v2"; make)
 
-run-v2-tests: run-v2-tests-single run-v2-tests-cluster run-v2-tests-resilientsingle
+run-v2-tests: run-v2-tests-single run-v2-tests-cluster
+ifeq ("$(AF_ENABLED)", "true")
+	make run-v2-tests-resilientsingle
+endif
 
 run-v2-tests-cluster: run-v2-tests-cluster-with-basic-auth run-v2-tests-cluster-without-ssl run-v2-tests-cluster-without-auth run-v2-tests-cluster-with-jwt-auth
 
@@ -559,9 +588,26 @@ run-v2-tests-resilientsingle: run-v2-tests-resilientsingle-with-auth
 
 run-v2-tests-resilientsingle-with-auth:
 	@echo "Resilient Single, with authentication, v2"
-	@${MAKE} TEST_MODE="resilientsingle" TEST_AUTH="rootpw" __run_v2_tests
+	@${MAKE} TEST_MODE="resilientsingle" TEST_AUTH="rootpw" TESTV2PARALLEL=1 __run_v2_tests
 
-apply-version:
-	@echo "Updating version to: $(DRIVER_VERSION)"
-	@VERSION=$(DRIVER_VERSION) go generate version-driver.go
-	@VERSION=$(DRIVER_VERSION) go generate ./v2/connection/version-driver.go
+GH_RELEASE := $(TMPDIR)/bin/github-release
+RELEASE := $(SCRIPTDIR)/tools/release
+V2_VERSION := ./v2/version/VERSION
+
+release-patch:
+	go run $(RELEASE) -type=patch -github-release=$(GH_RELEASE)
+
+release-minor:
+	go run $(RELEASE) -type=minor -github-release=$(GH_RELEASE)
+
+release-major:
+	go run $(RELEASE) -type=major -github-release=$(GH_RELEASE)
+
+release-v2-patch:
+	go run $(RELEASE) -type=patch -github-release=$(GH_RELEASE) -versionfile=$(V2_VERSION)
+
+release-v2-minor:
+	go run $(RELEASE) -type=minor -github-release=$(GH_RELEASE) -versionfile=$(V2_VERSION)
+
+release-v2-major:
+	go run $(RELEASE) -type=major -github-release=$(GH_RELEASE) -versionfile=$(V2_VERSION)

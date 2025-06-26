@@ -31,7 +31,8 @@ import (
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/eventreason"
-	"github.com/kedacore/keda/v2/pkg/prommetrics"
+	"github.com/kedacore/keda/v2/pkg/metricscollector"
+	"github.com/kedacore/keda/v2/pkg/util"
 )
 
 // TriggerAuthenticationReconciler reconciles a TriggerAuthentication object
@@ -90,6 +91,7 @@ func (r *TriggerAuthenticationReconciler) Reconcile(ctx context.Context, req ctr
 func (r *TriggerAuthenticationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kedav1alpha1.TriggerAuthentication{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		WithEventFilter(util.IgnoreOtherNamespaces()).
 		Complete(r)
 }
 
@@ -98,10 +100,10 @@ func (r *TriggerAuthenticationReconciler) updatePromMetrics(triggerAuth *kedav1a
 	defer triggerAuthPromMetricsLock.Unlock()
 
 	if metricsData, ok := triggerAuthPromMetricsMap[namespacedName]; ok {
-		prommetrics.DecrementCRDTotal(prommetrics.TriggerAuthenticationResource, metricsData.namespace)
+		metricscollector.DecrementCRDTotal(metricscollector.TriggerAuthenticationResource, metricsData.namespace)
 	}
 
-	prommetrics.IncrementCRDTotal(prommetrics.TriggerAuthenticationResource, triggerAuth.Namespace)
+	metricscollector.IncrementCRDTotal(metricscollector.TriggerAuthenticationResource, triggerAuth.Namespace)
 	triggerAuthPromMetricsMap[namespacedName] = triggerAuthMetricsData{namespace: triggerAuth.Namespace}
 }
 
@@ -111,7 +113,7 @@ func (r *TriggerAuthenticationReconciler) UpdatePromMetricsOnDelete(namespacedNa
 	defer triggerAuthPromMetricsLock.Unlock()
 
 	if metricsData, ok := triggerAuthPromMetricsMap[namespacedName]; ok {
-		prommetrics.DecrementCRDTotal(prommetrics.TriggerAuthenticationResource, metricsData.namespace)
+		metricscollector.DecrementCRDTotal(metricscollector.TriggerAuthenticationResource, metricsData.namespace)
 	}
 
 	delete(triggerAuthPromMetricsMap, namespacedName)

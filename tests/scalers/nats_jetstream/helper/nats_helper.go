@@ -18,10 +18,11 @@ type JetStreamTemplateData struct {
 }
 
 const (
-	NatsJetStreamName          = "nats"
-	NatsJetStreamConsumerName  = "PULL_CONSUMER"
-	NatsJetStreamChartVersion  = "0.18.2"
-	NatsJetStreamServerVersion = "2.9.3"
+	NatsJetStreamName              = "nats"
+	NatsJetStreamConsumerName      = "PULL_CONSUMER"
+	Natsv2_10JetStreamChartVersion = "1.1.2"
+	NatsJetStreamChartVersion      = "0.18.2"
+	NatsJetStreamServerVersion     = "2.9.3"
 )
 
 type JetStreamDeploymentTemplateData struct {
@@ -96,6 +97,28 @@ spec:
           nats consumer add {{.NatsStream}} {{.NatsConsumer}} --pull --deliver=all --ack=explicit --replay=instant
                                                               --filter="" --max-deliver="-1" --max-pending=1000
                                                               --no-headers-only --wait=5s --backoff=none'
+        ]
+      restartPolicy: OnFailure
+  backoffLimit: 4
+  `
+
+	StepDownConsumer = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: step-down
+  namespace: {{.TestNamespace}}
+spec:
+  ttlSecondsAfterFinished: 15
+  template:
+    spec:
+      containers:
+      - name: stepdown
+        image: "natsio/nats-box:0.13.2"
+        imagePullPolicy: Always
+        command: [
+          'sh', '-c', 'nats context save local --server {{.NatsAddress}} --select &&
+          nats consumer cluster step-down {{.NatsStream}} {{.NatsConsumer}}'
         ]
       restartPolicy: OnFailure
   backoffLimit: 4

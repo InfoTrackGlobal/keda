@@ -7,10 +7,13 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+
+	awsutils "github.com/kedacore/keda/v2/pkg/scalers/aws"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const (
@@ -167,7 +170,7 @@ var dynamoTestCases = []parseDynamoDBMetadataTestData{
 			"targetValue":               "3",
 		},
 		authParams:    map[string]string{},
-		expectedError: ErrAwsNoAccessKey,
+		expectedError: awsutils.ErrAwsNoAccessKey,
 	},
 	{
 		name: "authentication provided",
@@ -185,15 +188,15 @@ var dynamoTestCases = []parseDynamoDBMetadataTestData{
 			tableName:                 "test",
 			awsRegion:                 "eu-west-1",
 			keyConditionExpression:    "#yr = :yyyy",
-			expressionAttributeNames:  map[string]*string{"#yr": &year},
-			expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+			expressionAttributeNames:  map[string]string{"#yr": year},
+			expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 			targetValue:               3,
-			scalerIndex:               1,
+			triggerIndex:              1,
 			metricName:                "s1-aws-dynamodb-test",
-			awsAuthorization: awsAuthorizationMetadata{
-				awsAccessKeyID:     "none",
-				awsSecretAccessKey: "none",
-				podIdentityOwner:   true,
+			awsAuthorization: awsutils.AuthorizationMetadata{
+				AwsAccessKeyID:     "none",
+				AwsSecretAccessKey: "none",
+				PodIdentityOwner:   true,
 			},
 		},
 	},
@@ -215,15 +218,15 @@ var dynamoTestCases = []parseDynamoDBMetadataTestData{
 			awsRegion:                 "eu-west-1",
 			awsEndpoint:               "http://localhost:4566",
 			keyConditionExpression:    "#yr = :yyyy",
-			expressionAttributeNames:  map[string]*string{"#yr": &year},
-			expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+			expressionAttributeNames:  map[string]string{"#yr": year},
+			expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 			targetValue:               3,
-			scalerIndex:               1,
+			triggerIndex:              1,
 			metricName:                "s1-aws-dynamodb-test",
-			awsAuthorization: awsAuthorizationMetadata{
-				awsAccessKeyID:     "none",
-				awsSecretAccessKey: "none",
-				podIdentityOwner:   true,
+			awsAuthorization: awsutils.AuthorizationMetadata{
+				AwsAccessKeyID:     "none",
+				AwsSecretAccessKey: "none",
+				PodIdentityOwner:   true,
 			},
 		},
 	},
@@ -244,16 +247,16 @@ var dynamoTestCases = []parseDynamoDBMetadataTestData{
 			tableName:                 "test",
 			awsRegion:                 "eu-west-1",
 			keyConditionExpression:    "#yr = :yyyy",
-			expressionAttributeNames:  map[string]*string{"#yr": &year},
-			expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+			expressionAttributeNames:  map[string]string{"#yr": year},
+			expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 			activationTargetValue:     1,
 			targetValue:               3,
-			scalerIndex:               1,
+			triggerIndex:              1,
 			metricName:                "s1-aws-dynamodb-test",
-			awsAuthorization: awsAuthorizationMetadata{
-				awsAccessKeyID:     "none",
-				awsSecretAccessKey: "none",
-				podIdentityOwner:   true,
+			awsAuthorization: awsutils.AuthorizationMetadata{
+				AwsAccessKeyID:     "none",
+				AwsSecretAccessKey: "none",
+				PodIdentityOwner:   true,
 			},
 		},
 	},
@@ -275,15 +278,15 @@ var dynamoTestCases = []parseDynamoDBMetadataTestData{
 			awsRegion:                 "eu-west-1",
 			indexName:                 "test-index",
 			keyConditionExpression:    "#yr = :yyyy",
-			expressionAttributeNames:  map[string]*string{"#yr": &year},
-			expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+			expressionAttributeNames:  map[string]string{"#yr": year},
+			expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 			targetValue:               3,
-			scalerIndex:               1,
+			triggerIndex:              1,
 			metricName:                "s1-aws-dynamodb-test",
-			awsAuthorization: awsAuthorizationMetadata{
-				awsAccessKeyID:     "none",
-				awsSecretAccessKey: "none",
-				podIdentityOwner:   true,
+			awsAuthorization: awsutils.AuthorizationMetadata{
+				AwsAccessKeyID:     "none",
+				AwsSecretAccessKey: "none",
+				PodIdentityOwner:   true,
 			},
 		},
 	},
@@ -292,11 +295,11 @@ var dynamoTestCases = []parseDynamoDBMetadataTestData{
 func TestParseDynamoMetadata(t *testing.T) {
 	for _, tc := range dynamoTestCases {
 		t.Run(tc.name, func(t *testing.T) {
-			metadata, err := parseAwsDynamoDBMetadata(&ScalerConfig{
+			metadata, err := parseAwsDynamoDBMetadata(&scalersconfig.ScalerConfig{
 				TriggerMetadata: tc.metadata,
 				AuthParams:      tc.authParams,
 				ResolvedEnv:     tc.resolvedEnv,
-				ScalerIndex:     1,
+				TriggerIndex:    1,
 			})
 			if tc.expectedError != nil {
 				assert.ErrorContains(t, err, tc.expectedError.Error())
@@ -310,61 +313,60 @@ func TestParseDynamoMetadata(t *testing.T) {
 }
 
 type mockDynamoDB struct {
-	dynamodbiface.DynamoDBAPI
 }
 
-var result int64 = 4
-var indexResult int64 = 2
-var empty int64
+var result int32 = 4
+var indexResult int32 = 2
+var empty int32
 
-func (c *mockDynamoDB) Query(input *dynamodb.QueryInput) (*dynamodb.QueryOutput, error) {
+func (c *mockDynamoDB) Query(_ context.Context, input *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	switch *input.TableName {
 	case testAWSCloudwatchErrorMetric:
 		return nil, errors.New("error")
 	case testAWSCloudwatchNoValueMetric:
 		return &dynamodb.QueryOutput{
-			Count: &empty,
+			Count: empty,
 		}, nil
 	}
 
 	if input.IndexName != nil {
 		return &dynamodb.QueryOutput{
-			Count: &indexResult,
+			Count: indexResult,
 		}, nil
 	}
 
 	return &dynamodb.QueryOutput{
-		Count: &result,
+		Count: result,
 	}, nil
 }
 
 var year = "year"
 var target = "1994"
-var yearAttr = dynamodb.AttributeValue{N: &target}
+var yearAttr = &types.AttributeValueMemberN{Value: target}
 
 var awsDynamoDBGetMetricTestData = []awsDynamoDBMetadata{
 	{
 		tableName:                 "ValidTable",
 		awsRegion:                 "eu-west-1",
 		keyConditionExpression:    "#yr = :yyyy",
-		expressionAttributeNames:  map[string]*string{"#yr": &year},
-		expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+		expressionAttributeNames:  map[string]string{"#yr": year},
+		expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 		targetValue:               3,
 	},
 	{
 		tableName:                 testAWSDynamoErrorTable,
 		awsRegion:                 "eu-west-1",
 		keyConditionExpression:    "#yr = :yyyy",
-		expressionAttributeNames:  map[string]*string{"#yr": &year},
-		expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+		expressionAttributeNames:  map[string]string{"#yr": year},
+		expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 		targetValue:               3,
 	},
 	{
 		tableName:                 testAWSDynamoNoValueTable,
 		awsRegion:                 "eu-west-1",
 		keyConditionExpression:    "#yr = :yyyy",
-		expressionAttributeNames:  map[string]*string{"#yr": &year},
-		expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+		expressionAttributeNames:  map[string]string{"#yr": year},
+		expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 		targetValue:               3,
 	},
 	{
@@ -372,8 +374,8 @@ var awsDynamoDBGetMetricTestData = []awsDynamoDBMetadata{
 		awsRegion:                 "eu-west-1",
 		indexName:                 "test-index",
 		keyConditionExpression:    "#yr = :yyyy",
-		expressionAttributeNames:  map[string]*string{"#yr": &year},
-		expressionAttributeValues: map[string]*dynamodb.AttributeValue{":yyyy": &yearAttr},
+		expressionAttributeNames:  map[string]string{"#yr": year},
+		expressionAttributeValues: map[string]types.AttributeValue{":yyyy": yearAttr},
 		activationTargetValue:     3,
 		targetValue:               3,
 	},
@@ -404,7 +406,7 @@ func TestDynamoGetQueryMetrics(t *testing.T) {
 		t.Run(meta.tableName, func(t *testing.T) {
 			scaler := awsDynamoDBScaler{"", &meta, &mockDynamoDB{}, logr.Discard()}
 
-			value, err := scaler.GetQueryMetrics()
+			value, err := scaler.GetQueryMetrics(context.Background())
 			switch meta.tableName {
 			case testAWSDynamoErrorTable:
 				assert.EqualError(t, err, "error", "expect error because of dynamodb api error")

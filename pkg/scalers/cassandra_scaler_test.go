@@ -2,10 +2,14 @@ package scalers
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 
 	"github.com/go-logr/logr"
 	"github.com/gocql/gocql"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseCassandraMetadataTestData struct {
@@ -14,9 +18,15 @@ type parseCassandraMetadataTestData struct {
 	authParams map[string]string
 }
 
+type parseCassandraTLSTestData struct {
+	authParams map[string]string
+	isError    bool
+	enableTLS  bool
+}
+
 type cassandraMetricIdentifier struct {
 	metadataTestData *parseCassandraMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -24,25 +34,36 @@ var testCassandraMetadata = []parseCassandraMetadataTestData{
 	// nothing passed
 	{map[string]string{}, true, map[string]string{}},
 	// everything is passed in verbatim
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "port": "9042", "clusterIPAddress": "cassandra.test", "keyspace": "test_keyspace", "ScalerIndex": "0"}, false, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "port": "9042", "clusterIPAddress": "cassandra.test", "keyspace": "test_keyspace", "TriggerIndex": "0"}, false, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// metricName is generated from keyspace
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "ScalerIndex": "0"}, false, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}, false, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no query passed
-	{map[string]string{"targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "ScalerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no targetQueryValue passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "ScalerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no username passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "ScalerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no port passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test", "keyspace": "test_keyspace", "ScalerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test", "keyspace": "test_keyspace", "TriggerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no clusterIPAddress passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "port": "9042", "keyspace": "test_keyspace", "ScalerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "port": "9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no keyspace passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "ScalerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "TriggerIndex": "0"}, true, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
 	// no password passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "ScalerIndex": "0"}, true, map[string]string{}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}, true, map[string]string{}},
 	// fix issue[4110] passed
-	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "port": "9042", "clusterIPAddress": "https://cassandra.test", "keyspace": "test_keyspace", "ScalerIndex": "0"}, false, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+	{map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "port": "9042", "clusterIPAddress": "https://cassandra.test", "keyspace": "test_keyspace", "TriggerIndex": "0"}, false, map[string]string{"password": "Y2Fzc2FuZHJhCg=="}},
+}
+
+var tlsAuthParamsTestData = []parseCassandraTLSTestData{
+	// success, TLS cert/key
+	{map[string]string{"tls": "enable", "cert": "ceert", "key": "keey", "password": "Y2Fzc2FuZHJhCg=="}, false, true},
+	// failure, TLS missing cert
+	{map[string]string{"tls": "enable", "key": "keey", "password": "Y2Fzc2FuZHJhCg=="}, true, false},
+	// failure, TLS missing key
+	{map[string]string{"tls": "enable", "cert": "ceert", "password": "Y2Fzc2FuZHJhCg=="}, true, false},
+	// failure, TLS invalid
+	{map[string]string{"tls": "yes", "cert": "ceert", "key": "keeey", "password": "Y2Fzc2FuZHJhCg=="}, true, false},
 }
 
 var cassandraMetricIdentifiers = []cassandraMetricIdentifier{
@@ -53,7 +74,7 @@ var cassandraMetricIdentifiers = []cassandraMetricIdentifier{
 func TestCassandraParseMetadata(t *testing.T) {
 	testCaseNum := 1
 	for _, testData := range testCassandraMetadata {
-		_, err := parseCassandraMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		_, err := parseCassandraMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 		if err != nil && !testData.isError {
 			t.Errorf("Expected success but got error for unit test # %v", testCaseNum)
 		}
@@ -66,7 +87,7 @@ func TestCassandraParseMetadata(t *testing.T) {
 
 func TestCassandraGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range cassandraMetricIdentifiers {
-		meta, err := parseCassandraMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ScalerIndex: testData.scalerIndex, AuthParams: testData.metadataTestData.authParams})
+		meta, err := parseCassandraMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, TriggerIndex: testData.triggerIndex, AuthParams: testData.metadataTestData.authParams})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -78,6 +99,59 @@ func TestCassandraGetMetricSpecForScaling(t *testing.T) {
 		metricName := metricSpec[0].External.Metric.Name
 		if metricName != testData.name {
 			t.Errorf("Wrong External metric source name: %s, expected: %s", metricName, testData.name)
+		}
+	}
+}
+
+func assertCertContents(testData parseCassandraTLSTestData, meta *CassandraMetadata, prop string) error {
+	if testData.authParams[prop] != "" {
+		var path string
+		switch prop {
+		case "cert":
+			path = meta.cert
+		case "key":
+			path = meta.key
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("expected to find '%v' file at %v", prop, path)
+		}
+		contents := string(data)
+		if contents != testData.authParams[prop] {
+			return fmt.Errorf("expected value: '%v' but got '%v'", testData.authParams[prop], contents)
+		}
+	}
+	return nil
+}
+
+var successMetaData = map[string]string{"query": "SELECT COUNT(*) FROM test_keyspace.test_table;", "targetQueryValue": "1", "username": "cassandra", "clusterIPAddress": "cassandra.test:9042", "keyspace": "test_keyspace", "TriggerIndex": "0"}
+
+func TestParseCassandraTLS(t *testing.T) {
+	for _, testData := range tlsAuthParamsTestData {
+		meta, err := parseCassandraMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: successMetaData, AuthParams: testData.authParams})
+
+		if err != nil && !testData.isError {
+			t.Error("Expected success but got error", err)
+		}
+		if testData.isError && err == nil {
+			t.Error("Expected error but got success")
+		}
+		if meta.enableTLS != testData.enableTLS {
+			t.Errorf("Expected enableTLS to be set to %v but got %v\n", testData.enableTLS, meta.enableTLS)
+		}
+		if meta.enableTLS {
+			if meta.cert != testData.authParams["cert"] {
+				err := assertCertContents(testData, meta, "cert")
+				if err != nil {
+					t.Errorf(err.Error())
+				}
+			}
+			if meta.key != testData.authParams["key"] {
+				err := assertCertContents(testData, meta, "key")
+				if err != nil {
+					t.Errorf(err.Error())
+				}
+			}
 		}
 	}
 }

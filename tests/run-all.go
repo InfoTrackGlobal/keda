@@ -41,9 +41,23 @@ type TestResult struct {
 func main() {
 	ctx := context.Background()
 
+	//
+	// Detect test cases
+	//
 	e2eRegex := os.Getenv("E2E_TEST_REGEX")
 	if e2eRegex == "" {
 		e2eRegex = ".*_test.go"
+	}
+
+	regularTestFiles := getRegularTestFiles(e2eRegex)
+	sequentialTestFiles := getSequentialTestFiles(e2eRegex)
+	if len(regularTestFiles) == 0 && len(sequentialTestFiles) == 0 {
+		fmt.Printf("No test has been executed, please review your regex: '%s'\n", e2eRegex)
+		os.Exit(1)
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "regex-check" {
+		return
 	}
 
 	//
@@ -52,18 +66,8 @@ func main() {
 	installation := executeTest(ctx, "tests/utils/setup_test.go", "15m", 1)
 	fmt.Print(installation.Attempts[0])
 	if !installation.Passed {
+		printKedaLogs()
 		uninstallKeda(ctx)
-		os.Exit(1)
-	}
-
-	//
-	// Detect test cases
-	//
-	regularTestFiles := getRegularTestFiles(e2eRegex)
-	sequentialTestFiles := getSequentialTestFiles(e2eRegex)
-	if len(regularTestFiles) == 0 && len(sequentialTestFiles) == 0 {
-		uninstallKeda(ctx)
-		fmt.Printf("No test has been executed, please review your regex: '%s'\n", e2eRegex)
 		os.Exit(1)
 	}
 
@@ -225,32 +229,7 @@ func executeRegularTests(ctx context.Context, testCases []string) []TestResult {
 	}
 
 	if len(testResults) > 0 {
-		kubeConfig, _ := config.GetConfig()
-		kubeClient, _ := kubernetes.NewForConfig(kubeConfig)
-
-		operatorLogs, err := helper.FindPodLogs(kubeClient, "keda", "app=keda-operator")
-		if err == nil {
-			fmt.Println(">>> KEDA Operator log <<<")
-			fmt.Println(operatorLogs)
-			fmt.Println("##############################################")
-			fmt.Println("##############################################")
-		}
-
-		msLogs, err := helper.FindPodLogs(kubeClient, "keda", "app=keda-metrics-apiserver")
-		if err == nil {
-			fmt.Println(">>> KEDA Metrics Server log <<<")
-			fmt.Println(msLogs)
-			fmt.Println("##############################################")
-			fmt.Println("##############################################")
-		}
-
-		hooksLogs, err := helper.FindPodLogs(kubeClient, "keda", "app=keda-admission-webhooks")
-		if err == nil {
-			fmt.Println(">>> KEDA Admission Webhooks log <<<")
-			fmt.Println(hooksLogs)
-			fmt.Println("##############################################")
-			fmt.Println("##############################################")
-		}
+		printKedaLogs()
 	}
 	return testResults
 }
@@ -366,4 +345,50 @@ func numberToWord(num int) string {
 		return words[num]
 	}
 	return fmt.Sprintf("%d", num)
+}
+
+func printKedaLogs() {
+	kubeConfig, _ := config.GetConfig()
+	kubeClient, _ := kubernetes.NewForConfig(kubeConfig)
+
+	operatorLogs, err := helper.FindPodLogs(kubeClient, "keda", "app=keda-operator", true)
+	if err == nil {
+		fmt.Println(">>> KEDA Operator log <<<")
+		fmt.Println(operatorLogs)
+		fmt.Println("##############################################")
+		fmt.Println("##############################################")
+		saveLogToFile("keda-operator.log", operatorLogs)
+	}
+
+	msLogs, err := helper.FindPodLogs(kubeClient, "keda", "app=keda-metrics-apiserver", true)
+	if err == nil {
+		fmt.Println(">>> KEDA Metrics Server log <<<")
+		fmt.Println(msLogs)
+		fmt.Println("##############################################")
+		fmt.Println("##############################################")
+		saveLogToFile("keda-metrics-server.log", msLogs)
+	}
+
+	hooksLogs, err := helper.FindPodLogs(kubeClient, "keda", "app=keda-admission-webhooks", true)
+	if err == nil {
+		fmt.Println(">>> KEDA Admission Webhooks log <<<")
+		fmt.Println(hooksLogs)
+		fmt.Println("##############################################")
+		fmt.Println("##############################################")
+		saveLogToFile("keda-webhooks.log", hooksLogs)
+	}
+}
+
+func saveLogToFile(file string, lines []string) {
+	f, err := os.Create(file)
+	if err != nil {
+		fmt.Print(err)
+	}
+	defer f.Close()
+	for _, line := range lines {
+		_, err := f.WriteString(line + "\n")
+		if err != nil {
+			fmt.Print(err)
+		}
+	}
 }

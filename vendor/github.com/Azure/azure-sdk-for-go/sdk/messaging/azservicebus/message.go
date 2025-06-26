@@ -9,6 +9,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/internal/log"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/amqpwrap"
 	"github.com/Azure/go-amqp"
 )
 
@@ -126,10 +127,29 @@ type ReceivedMessage struct {
 	// and Header fields.
 	RawAMQPMessage *AMQPAnnotatedMessage
 
-	// deferred indicates we received it using ReceiveDeferredMessages. These messages
-	// will still go through the normal Receiver.Settle functions but internally will
-	// always be settled with the management link.
-	deferred bool
+	linkName string // used when we call into the management link. It counts towards a link not being considered idle.
+
+	settleOnMgmtLink bool // used for cases like when a message is received that was deferred. It can only be settled on the management link.
+}
+
+// Message creates a shallow copy of the fields from this message to an instance of
+// [Message].
+func (rm *ReceivedMessage) Message() *Message {
+	return &Message{
+		ApplicationProperties: rm.ApplicationProperties,
+		Body:                  rm.Body,
+		ContentType:           rm.ContentType,
+		CorrelationID:         rm.CorrelationID,
+		MessageID:             &rm.MessageID,
+		PartitionKey:          rm.PartitionKey,
+		ReplyTo:               rm.ReplyTo,
+		ReplyToSessionID:      rm.ReplyToSessionID,
+		ScheduledEnqueueTime:  rm.ScheduledEnqueueTime,
+		SessionID:             rm.SessionID,
+		Subject:               rm.Subject,
+		TimeToLive:            rm.TimeToLive,
+		To:                    rm.To,
+	}
 }
 
 // MessageState represents the current state of a message (Active, Scheduled, Deferred).
@@ -284,38 +304,17 @@ func (m *Message) toAMQPMessage() *amqp.Message {
 		amqpMsg.Annotations[scheduledEnqueuedTimeAnnotation] = *m.ScheduledEnqueueTime
 	}
 
-	// TODO: These are 'received' message properties so I believe their inclusion here was just an artifact of only
-	// having one message type.
-
-	// if m.SystemProperties != nil {
-	// 	// Set the raw annotations first (they may be nil) and add the explicit
-	// 	// system properties second to ensure they're set properly.
-	// 	amqpMsg.Annotations = addMapToAnnotations(amqpMsg.Annotations, m.SystemProperties.Annotations)
-
-	// 	sysPropMap, err := encodeStructureToMap(m.SystemProperties)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	amqpMsg.Annotations = addMapToAnnotations(amqpMsg.Annotations, sysPropMap)
-	// }
-
-	// if m.LockToken != nil {
-	// 	if amqpMsg.DeliveryAnnotations == nil {
-	// 		amqpMsg.DeliveryAnnotations = make(amqp.Annotations)
-	// 	}
-	// 	amqpMsg.DeliveryAnnotations[lockTokenName] = *m.LockToken
-	// }
-
 	return amqpMsg
 }
 
 // newReceivedMessage creates a received message from an AMQP message.
 // NOTE: this converter assumes that the Body of this message will be the first
 // serialized byte array in the Data section of the messsage.
-func newReceivedMessage(amqpMsg *amqp.Message, receivingLinkName string) *ReceivedMessage {
+func newReceivedMessage(amqpMsg *amqp.Message, receiver amqpwrap.AMQPReceiver) *ReceivedMessage {
 	msg := &ReceivedMessage{
-		RawAMQPMessage: newAMQPAnnotatedMessage(amqpMsg, receivingLinkName),
+		RawAMQPMessage: newAMQPAnnotatedMessage(amqpMsg, receiver.LinkName()),
 		State:          MessageStateActive,
+		linkName:       receiver.LinkName(),
 	}
 
 	if len(msg.RawAMQPMessage.Body.Data) == 1 {

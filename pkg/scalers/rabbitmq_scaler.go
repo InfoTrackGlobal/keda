@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/scalers/azure"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -78,7 +80,7 @@ type rabbitMQMetadata struct {
 	pageSize              int64         // specify the page size if useRegex is enabled
 	operation             string        // specify the operation to apply in case of multiples queues
 	timeout               time.Duration // custom http timeout for a specific trigger
-	scalerIndex           int           // scaler index
+	triggerIndex          int           // scaler index
 
 	// TLS
 	ca          string
@@ -89,8 +91,10 @@ type rabbitMQMetadata struct {
 	unsafeSsl   bool
 
 	// token provider for azure AD
-	workloadIdentityClientID string
-	workloadIdentityResource string
+	workloadIdentityClientID      string
+	workloadIdentityTenantID      string
+	workloadIdentityAuthorityHost string
+	workloadIdentityResource      string
 }
 
 type queueInfo struct {
@@ -115,7 +119,7 @@ type publishDetail struct {
 }
 
 // NewRabbitMQScaler creates a new rabbitMQ scaler
-func NewRabbitMQScaler(config *ScalerConfig) (Scaler, error) {
+func NewRabbitMQScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	s := &rabbitMQScaler{}
 
 	metricType, err := GetMetricTargetType(config)
@@ -132,6 +136,14 @@ func NewRabbitMQScaler(config *ScalerConfig) (Scaler, error) {
 	}
 	s.metadata = meta
 	s.httpClient = kedautil.CreateHTTPClient(meta.timeout, meta.unsafeSsl)
+
+	if meta.enableTLS {
+		tlsConfig, tlsErr := kedautil.NewTLSConfigWithPassword(meta.cert, meta.key, meta.keyPassword, meta.ca, meta.unsafeSsl)
+		if tlsErr != nil {
+			return nil, tlsErr
+		}
+		s.httpClient.Transport = kedautil.CreateHTTPTransportWithTLSConfig(tlsConfig)
+	}
 
 	if meta.protocol == amqpProtocol {
 		// Override vhost if requested.
@@ -156,7 +168,7 @@ func NewRabbitMQScaler(config *ScalerConfig) (Scaler, error) {
 	return s, nil
 }
 
-func resolveProtocol(config *ScalerConfig, meta *rabbitMQMetadata) error {
+func resolveProtocol(config *scalersconfig.ScalerConfig, meta *rabbitMQMetadata) error {
 	meta.protocol = defaultProtocol
 	if val, ok := config.AuthParams["protocol"]; ok {
 		meta.protocol = val
@@ -170,7 +182,7 @@ func resolveProtocol(config *ScalerConfig, meta *rabbitMQMetadata) error {
 	return nil
 }
 
-func resolveHostValue(config *ScalerConfig, meta *rabbitMQMetadata) error {
+func resolveHostValue(config *scalersconfig.ScalerConfig, meta *rabbitMQMetadata) error {
 	switch {
 	case config.AuthParams["host"] != "":
 		meta.host = config.AuthParams["host"]
@@ -184,7 +196,7 @@ func resolveHostValue(config *ScalerConfig, meta *rabbitMQMetadata) error {
 	return nil
 }
 
-func resolveTimeout(config *ScalerConfig, meta *rabbitMQMetadata) error {
+func resolveTimeout(config *scalersconfig.ScalerConfig, meta *rabbitMQMetadata) error {
 	if val, ok := config.TriggerMetadata["timeout"]; ok {
 		timeoutMS, err := strconv.Atoi(val)
 		if err != nil {
@@ -203,7 +215,7 @@ func resolveTimeout(config *ScalerConfig, meta *rabbitMQMetadata) error {
 	return nil
 }
 
-func resolveTLSAuthParams(config *ScalerConfig, meta *rabbitMQMetadata) error {
+func resolveTLSAuthParams(config *scalersconfig.ScalerConfig, meta *rabbitMQMetadata) error {
 	meta.enableTLS = false
 	if val, ok := config.AuthParams["tls"]; ok {
 		val = strings.TrimSpace(val)
@@ -219,7 +231,7 @@ func resolveTLSAuthParams(config *ScalerConfig, meta *rabbitMQMetadata) error {
 	return nil
 }
 
-func parseRabbitMQMetadata(config *ScalerConfig) (*rabbitMQMetadata, error) {
+func parseRabbitMQMetadata(config *scalersconfig.ScalerConfig) (*rabbitMQMetadata, error) {
 	meta := rabbitMQMetadata{}
 
 	// Resolve protocol type
@@ -242,6 +254,7 @@ func parseRabbitMQMetadata(config *ScalerConfig) (*rabbitMQMetadata, error) {
 	if config.PodIdentity.Provider == v1alpha1.PodIdentityProviderAzureWorkload {
 		if config.AuthParams["workloadIdentityResource"] != "" {
 			meta.workloadIdentityClientID = config.PodIdentity.GetIdentityID()
+			meta.workloadIdentityTenantID = config.PodIdentity.GetIdentityTenantID()
 			meta.workloadIdentityResource = config.AuthParams["workloadIdentityResource"]
 		}
 	}
@@ -314,12 +327,12 @@ func parseRabbitMQMetadata(config *ScalerConfig) (*rabbitMQMetadata, error) {
 	if err := resolveTimeout(config, &meta); err != nil {
 		return nil, err
 	}
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	return &meta, nil
 }
 
-func parseRabbitMQHttpProtocolMetadata(config *ScalerConfig, meta *rabbitMQMetadata) error {
+func parseRabbitMQHttpProtocolMetadata(config *scalersconfig.ScalerConfig, meta *rabbitMQMetadata) error {
 	// Resolve useRegex
 	if val, ok := config.TriggerMetadata["useRegex"]; ok {
 		useRegex, err := strconv.ParseBool(val)
@@ -361,7 +374,7 @@ func parseRabbitMQHttpProtocolMetadata(config *ScalerConfig, meta *rabbitMQMetad
 	return nil
 }
 
-func parseTrigger(meta *rabbitMQMetadata, config *ScalerConfig) (*rabbitMQMetadata, error) {
+func parseTrigger(meta *rabbitMQMetadata, config *scalersconfig.ScalerConfig) (*rabbitMQMetadata, error) {
 	deprecatedQueueLengthValue, deprecatedQueueLengthPresent := config.TriggerMetadata[rabbitQueueLengthMetricName]
 	mode, modePresent := config.TriggerMetadata[rabbitModeTriggerConfigName]
 	value, valuePresent := config.TriggerMetadata[rabbitValueTriggerConfigName]
@@ -441,9 +454,10 @@ func getConnectionAndChannel(host string, meta *rabbitMQMetadata) (*amqp.Connect
 	var err error
 	if meta.enableTLS {
 		tlsConfig, configErr := kedautil.NewTLSConfigWithPassword(meta.cert, meta.key, meta.keyPassword, meta.ca, meta.unsafeSsl)
-		if configErr == nil {
-			conn, err = amqp.DialTLS(host, tlsConfig)
+		if configErr != nil {
+			return nil, nil, configErr
 		}
+		conn, err = amqp.DialTLS(host, tlsConfig)
 	} else {
 		conn, err = amqp.Dial(host)
 	}
@@ -467,6 +481,9 @@ func (s *rabbitMQScaler) Close(context.Context) error {
 			s.logger.Error(err, "Error closing rabbitmq connection")
 			return err
 		}
+	}
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
 	}
 	return nil
 }
@@ -505,7 +522,7 @@ func getJSON(ctx context.Context, s *rabbitMQScaler, url string) (queueInfo, err
 
 	if s.metadata.workloadIdentityResource != "" {
 		if s.azureOAuth == nil {
-			s.azureOAuth = azure.NewAzureADWorkloadIdentityTokenProvider(ctx, s.metadata.workloadIdentityClientID, s.metadata.workloadIdentityResource)
+			s.azureOAuth = azure.NewAzureADWorkloadIdentityTokenProvider(ctx, s.metadata.workloadIdentityClientID, s.metadata.workloadIdentityTenantID, s.metadata.workloadIdentityAuthorityHost, s.metadata.workloadIdentityResource)
 		}
 
 		err = s.azureOAuth.Refresh()
@@ -545,6 +562,24 @@ func getJSON(ctx context.Context, s *rabbitMQScaler, url string) (queueInfo, err
 	return result, fmt.Errorf("error requesting rabbitMQ API status: %s, response: %s, from: %s", r.Status, body, url)
 }
 
+func getVhostAndPathFromURL(rawPath, vhostName string) (resolvedVhostPath, resolvedPath string) {
+	pathParts := strings.Split(rawPath, "/")
+	resolvedVhostPath = "/" + pathParts[len(pathParts)-1]
+	resolvedPath = path.Join(pathParts[:len(pathParts)-1]...)
+
+	if len(resolvedPath) > 0 {
+		resolvedPath = "/" + resolvedPath
+	}
+	if vhostName != "" {
+		resolvedVhostPath = "/" + url.QueryEscape(vhostName)
+	}
+	if resolvedVhostPath == "" || resolvedVhostPath == "/" || resolvedVhostPath == "//" {
+		resolvedVhostPath = rabbitRootVhostPath
+	}
+
+	return
+}
+
 func (s *rabbitMQScaler) getQueueInfoViaHTTP(ctx context.Context) (*queueInfo, error) {
 	parsedURL, err := url.Parse(s.metadata.host)
 
@@ -552,19 +587,8 @@ func (s *rabbitMQScaler) getQueueInfoViaHTTP(ctx context.Context) (*queueInfo, e
 		return nil, err
 	}
 
-	// Extract vhost from URL's path.
-	vhost := parsedURL.Path
-
-	if s.metadata.vhostName != "" {
-		vhost = "/" + url.QueryEscape(s.metadata.vhostName)
-	}
-
-	if vhost == "" || vhost == "/" || vhost == "//" {
-		vhost = rabbitRootVhostPath
-	}
-
-	// Clear URL path to get the correct host.
-	parsedURL.Path = ""
+	vhost, subpaths := getVhostAndPathFromURL(parsedURL.Path, s.metadata.vhostName)
+	parsedURL.Path = subpaths
 
 	var getQueueInfoManagementURI string
 	if s.metadata.useRegex {
@@ -587,7 +611,7 @@ func (s *rabbitMQScaler) getQueueInfoViaHTTP(ctx context.Context) (*queueInfo, e
 func (s *rabbitMQScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("rabbitmq-%s", url.QueryEscape(s.metadata.queueName)))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("rabbitmq-%s", url.QueryEscape(s.metadata.queueName)))),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.value),
 	}

@@ -1,5 +1,52 @@
 # Release History
 
+## 1.7.1 (2024-05-20)
+
+### Bugs Fixed
+
+- Emulator strings should allow for hosts other than localhost (PR#22898)
+
+## 1.7.0 (2024-04-02)
+
+### Features Added
+
+- Add in ability to handle emulator connection strings. (PR#22663)
+
+## 1.6.1 (2024-03-05)
+
+### Bugs Fixed
+
+- Fixed case where closing a Receiver/Sender after an idle period would take > 20 seconds. (PR#22509)
+- Fixed a potential memory leak when receiving a message on one receiver and attempting to settle with another. (PR#22431)
+
+## 1.6.0 (2024-01-17)
+
+### Features Added
+
+- ReceiverOptions.TimeAfterFirstMessage lets you configure the amount of time, after the first message in a batch is received, before we return messages. (PR#22154)
+
+### Bugs Fixed
+
+- Settling a message (using CompleteMessage, AbandonMessage, etc..) on a different Receiver instance than you received on no 
+  longer leaks memory. (PR#22253)
+
+## 1.5.0 (2023-10-10)
+
+### Features Added
+
+- Added `(Queue|Subscription|Topic)Name` fields to appropriate responses in the `admin.Client`. PR#21632
+
+## 1.4.1 (2023-09-12)
+
+### Features Added
+
+- `ReceivedMessage` can be converted to a `Message` for easier re-sending, using `ReceivedMessage.Message()`. PR#21472
+
+### Bugs Fixed
+
+- admin.Client properly populates the request body when retrying operations. PR#21496
+- Senders could potentially hang forever on SendMessage() calls due to a race condition. Fixed by upgrading to go-amqp v1.0.2. PR#21465
+
 ## 1.4.0 (2023-06-06)
 
 ### Features Added

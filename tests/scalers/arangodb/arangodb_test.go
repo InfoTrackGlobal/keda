@@ -201,14 +201,17 @@ spec:
 )
 
 func TestArangoDBScaler(t *testing.T) {
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
-
+	data, templates := getTemplateData()
 	CreateNamespace(t, kc, testNamespace)
+	t.Cleanup(func() {
+		arangodb.UninstallArangoDB(t, testNamespace)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
+	// Create kubernetes resources
 	arangodb.InstallArangoDB(t, kc, testNamespace)
 	arangodb.SetupArangoDB(t, kc, testNamespace, arangoDBName, arangoDBCollection)
-
-	data, templates := getTemplateData()
 	KubectlApplyMultipleWithTemplate(t, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
@@ -217,13 +220,6 @@ func TestArangoDBScaler(t *testing.T) {
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc, data)
-
-	// cleanup
-	KubectlDeleteMultipleWithTemplate(t, data, templates)
-	arangodb.UninstallArangoDB(t, testNamespace)
-
-	DeleteNamespace(t, testNamespace)
-	WaitForNamespaceDeletion(t, testNamespace)
 }
 
 func getTemplateData() (templateData, []Template) {
@@ -249,7 +245,7 @@ func getTemplateData() (templateData, []Template) {
 func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation ---")
 
-	KubectlApplyWithTemplate(t, data, "generateLowLevelDataJobTemplate", generateLowLevelDataJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateLowLevelDataJobTemplate", generateLowLevelDataJobTemplate)
 	assert.True(t, WaitForJobSuccess(t, kc, "generate-low-level-data-job", testNamespace, 5, 60), "test activation job failed")
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
@@ -258,7 +254,7 @@ func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out ---")
 
-	KubectlApplyWithTemplate(t, data, "generateDataJobTemplate", generateDataJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateDataJobTemplate", generateDataJobTemplate)
 	assert.True(t, WaitForJobSuccess(t, kc, "generate-data-job", testNamespace, 5, 60), "test scale-out job failed")
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
@@ -268,7 +264,7 @@ func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 func testScaleIn(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale in ---")
 
-	KubectlApplyWithTemplate(t, data, "deleteDataJobTemplate", deleteDataJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "deleteDataJobTemplate", deleteDataJobTemplate)
 	assert.True(t, WaitForJobSuccess(t, kc, "delete-data-job", testNamespace, 5, 60), "test scale-in job failed")
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 5),

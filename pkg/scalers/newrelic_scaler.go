@@ -12,6 +12,7 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -40,10 +41,10 @@ type newrelicMetadata struct {
 	nrql                string
 	threshold           float64
 	activationThreshold float64
-	scalerIndex         int
+	triggerIndex        int
 }
 
-func NewNewRelicScaler(config *ScalerConfig) (Scaler, error) {
+func NewNewRelicScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -75,7 +76,7 @@ func NewNewRelicScaler(config *ScalerConfig) (Scaler, error) {
 		logger:     logger}, nil
 }
 
-func parseNewRelicMetadata(config *ScalerConfig, logger logr.Logger) (*newrelicMetadata, error) {
+func parseNewRelicMetadata(config *scalersconfig.ScalerConfig, logger logr.Logger) (*newrelicMetadata, error) {
 	meta := newrelicMetadata{}
 	var err error
 
@@ -116,7 +117,11 @@ func parseNewRelicMetadata(config *ScalerConfig, logger logr.Logger) (*newrelicM
 		}
 		meta.threshold = t
 	} else {
-		return nil, fmt.Errorf("missing %s value", threshold)
+		if config.AsMetricSource {
+			meta.threshold = 0
+		} else {
+			return nil, fmt.Errorf("missing %s value", threshold)
+		}
 	}
 
 	meta.activationThreshold = 0
@@ -139,7 +144,7 @@ func parseNewRelicMetadata(config *ScalerConfig, logger logr.Logger) (*newrelicM
 	} else {
 		meta.noDataError = false
 	}
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 	return &meta, nil
 }
 
@@ -152,6 +157,13 @@ func (s *newrelicScaler) executeNewRelicQuery(ctx context.Context) (float64, err
 	resp, err := s.nrClient.Nrdb.QueryWithContext(ctx, s.metadata.account, nrdbQuery)
 	if err != nil {
 		return 0, fmt.Errorf("error running NRQL %s (%s)", s.metadata.nrql, err.Error())
+	}
+	// Check for empty results set, as New Relic lib does not report these as errors
+	if len(resp.Results) == 0 {
+		if s.metadata.noDataError {
+			return 0, fmt.Errorf("query return no results %s", s.metadata.nrql)
+		}
+		return 0, nil
 	}
 	// Only use the first result from the query, as the query should not be multi row
 	for _, v := range resp.Results[0] {
@@ -183,7 +195,7 @@ func (s *newrelicScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpe
 
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, metricName),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, metricName),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.threshold),
 	}

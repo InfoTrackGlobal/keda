@@ -6,11 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/cloudwatch"
-	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+
+	awsutils "github.com/kedacore/keda/v2/pkg/scalers/aws"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const (
@@ -41,7 +43,7 @@ type parseAWSCloudwatchMetadataTestData struct {
 
 type awsCloudwatchMetricIdentifier struct {
 	metadataTestData *parseAWSCloudwatchMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -364,106 +366,105 @@ var awsCloudwatchMetricIdentifiers = []awsCloudwatchMetricIdentifier{
 
 var awsCloudwatchGetMetricTestData = []awsCloudwatchMetadata{
 	{
-		namespace:            "Custom",
-		metricsName:          "HasData",
-		dimensionName:        []string{"DIM"},
-		dimensionValue:       []string{"DIM_VALUE"},
-		targetMetricValue:    100,
-		minMetricValue:       0,
-		metricCollectionTime: 60,
-		metricStat:           "Average",
-		metricUnit:           "SampleCount",
-		metricStatPeriod:     60,
-		metricEndTimeOffset:  60,
-		awsRegion:            "us-west-2",
-		awsAuthorization:     awsAuthorizationMetadata{podIdentityOwner: false},
-		scalerIndex:          0,
+		Namespace:            "Custom",
+		MetricsName:          "HasData",
+		DimensionName:        []string{"DIM"},
+		DimensionValue:       []string{"DIM_VALUE"},
+		TargetMetricValue:    100,
+		MinMetricValue:       0,
+		MetricCollectionTime: 60,
+		MetricStat:           "Average",
+		MetricUnit:           "SampleCount",
+		MetricStatPeriod:     60,
+		MetricEndTimeOffset:  60,
+		AwsRegion:            "us-west-2",
+		awsAuthorization:     awsutils.AuthorizationMetadata{PodIdentityOwner: false},
+		triggerIndex:         0,
 	},
 	{
-		namespace:            "Custom",
-		metricsName:          "HasDataNoUnit",
-		dimensionName:        []string{"DIM"},
-		dimensionValue:       []string{"DIM_VALUE"},
-		targetMetricValue:    100,
-		minMetricValue:       0,
-		metricCollectionTime: 60,
-		metricStat:           "Average",
-		metricUnit:           "",
-		metricStatPeriod:     60,
-		metricEndTimeOffset:  60,
-		awsRegion:            "us-west-2",
-		awsAuthorization:     awsAuthorizationMetadata{podIdentityOwner: false},
-		scalerIndex:          0,
+		Namespace:            "Custom",
+		MetricsName:          "HasDataNoUnit",
+		DimensionName:        []string{"DIM"},
+		DimensionValue:       []string{"DIM_VALUE"},
+		TargetMetricValue:    100,
+		MinMetricValue:       0,
+		MetricCollectionTime: 60,
+		MetricStat:           "Average",
+		MetricUnit:           "",
+		MetricStatPeriod:     60,
+		MetricEndTimeOffset:  60,
+		AwsRegion:            "us-west-2",
+		awsAuthorization:     awsutils.AuthorizationMetadata{PodIdentityOwner: false},
+		triggerIndex:         0,
 	},
 	{
-		namespace:            "Custom",
-		metricsName:          testAWSCloudwatchErrorMetric,
-		dimensionName:        []string{"DIM"},
-		dimensionValue:       []string{"DIM_VALUE"},
-		targetMetricValue:    100,
-		minMetricValue:       0,
-		metricCollectionTime: 60,
-		metricStat:           "Average",
-		metricUnit:           "",
-		metricStatPeriod:     60,
-		metricEndTimeOffset:  60,
-		awsRegion:            "us-west-2",
-		awsAuthorization:     awsAuthorizationMetadata{podIdentityOwner: false},
-		scalerIndex:          0,
+		Namespace:            "Custom",
+		MetricsName:          testAWSCloudwatchErrorMetric,
+		DimensionName:        []string{"DIM"},
+		DimensionValue:       []string{"DIM_VALUE"},
+		TargetMetricValue:    100,
+		MinMetricValue:       0,
+		MetricCollectionTime: 60,
+		MetricStat:           "Average",
+		MetricUnit:           "",
+		MetricStatPeriod:     60,
+		MetricEndTimeOffset:  60,
+		AwsRegion:            "us-west-2",
+		awsAuthorization:     awsutils.AuthorizationMetadata{PodIdentityOwner: false},
+		triggerIndex:         0,
 	},
 	{
-		namespace:            "Custom",
-		metricsName:          testAWSCloudwatchNoValueMetric,
-		dimensionName:        []string{"DIM"},
-		dimensionValue:       []string{"DIM_VALUE"},
-		targetMetricValue:    100,
-		minMetricValue:       0,
-		metricCollectionTime: 60,
-		metricStat:           "Average",
-		metricUnit:           "",
-		metricStatPeriod:     60,
-		metricEndTimeOffset:  60,
-		awsRegion:            "us-west-2",
-		awsAuthorization:     awsAuthorizationMetadata{podIdentityOwner: false},
-		scalerIndex:          0,
+		Namespace:            "Custom",
+		MetricsName:          testAWSCloudwatchNoValueMetric,
+		DimensionName:        []string{"DIM"},
+		DimensionValue:       []string{"DIM_VALUE"},
+		TargetMetricValue:    100,
+		MinMetricValue:       0,
+		MetricCollectionTime: 60,
+		MetricStat:           "Average",
+		MetricUnit:           "",
+		MetricStatPeriod:     60,
+		MetricEndTimeOffset:  60,
+		AwsRegion:            "us-west-2",
+		awsAuthorization:     awsutils.AuthorizationMetadata{PodIdentityOwner: false},
+		triggerIndex:         0,
 	},
 	{
-		namespace:            "Custom",
-		metricsName:          "HasDataFromExpression",
-		expression:           "SELECT MIN(MessageCount) FROM \"AWS/AmazonMQ\" WHERE Broker = 'production' and Queue = 'worker'",
-		targetMetricValue:    100,
-		minMetricValue:       0,
-		metricCollectionTime: 60,
-		metricStat:           "Average",
-		metricUnit:           "SampleCount",
-		metricStatPeriod:     60,
-		metricEndTimeOffset:  60,
-		awsRegion:            "us-west-2",
-		awsAuthorization:     awsAuthorizationMetadata{podIdentityOwner: false},
-		scalerIndex:          0,
+		Namespace:            "Custom",
+		MetricsName:          "HasDataFromExpression",
+		Expression:           "SELECT MIN(MessageCount) FROM \"AWS/AmazonMQ\" WHERE Broker = 'production' and Queue = 'worker'",
+		TargetMetricValue:    100,
+		MinMetricValue:       0,
+		MetricCollectionTime: 60,
+		MetricStat:           "Average",
+		MetricUnit:           "SampleCount",
+		MetricStatPeriod:     60,
+		MetricEndTimeOffset:  60,
+		AwsRegion:            "us-west-2",
+		awsAuthorization:     awsutils.AuthorizationMetadata{PodIdentityOwner: false},
+		triggerIndex:         0,
 	},
 }
 
 type mockCloudwatch struct {
-	cloudwatchiface.CloudWatchAPI
 }
 
-func (m *mockCloudwatch) GetMetricData(input *cloudwatch.GetMetricDataInput) (*cloudwatch.GetMetricDataOutput, error) {
+func (m *mockCloudwatch) GetMetricData(_ context.Context, input *cloudwatch.GetMetricDataInput, _ ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error) {
 	if input.MetricDataQueries[0].MetricStat != nil {
 		switch *input.MetricDataQueries[0].MetricStat.Metric.MetricName {
 		case testAWSCloudwatchErrorMetric:
 			return nil, errors.New("error")
 		case testAWSCloudwatchNoValueMetric:
 			return &cloudwatch.GetMetricDataOutput{
-				MetricDataResults: []*cloudwatch.MetricDataResult{},
+				MetricDataResults: []types.MetricDataResult{},
 			}, nil
 		}
 	}
 
 	return &cloudwatch.GetMetricDataOutput{
-		MetricDataResults: []*cloudwatch.MetricDataResult{
+		MetricDataResults: []types.MetricDataResult{
 			{
-				Values: []*float64{aws.Float64(10)},
+				Values: []float64{10},
 			},
 		},
 	}, nil
@@ -471,7 +472,7 @@ func (m *mockCloudwatch) GetMetricData(input *cloudwatch.GetMetricDataInput) (*c
 
 func TestCloudwatchParseMetadata(t *testing.T) {
 	for _, testData := range testAWSCloudwatchMetadata {
-		_, err := parseAwsCloudwatchMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testAWSCloudwatchResolvedEnv, AuthParams: testData.authParams})
+		_, err := parseAwsCloudwatchMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testAWSCloudwatchResolvedEnv, AuthParams: testData.authParams})
 		if err != nil && !testData.isError {
 			t.Errorf("%s: Expected success but got error %s", testData.comment, err)
 		}
@@ -484,7 +485,7 @@ func TestCloudwatchParseMetadata(t *testing.T) {
 func TestAWSCloudwatchGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range awsCloudwatchMetricIdentifiers {
 		ctx := context.Background()
-		meta, err := parseAwsCloudwatchMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testAWSCloudwatchResolvedEnv, AuthParams: testData.metadataTestData.authParams, ScalerIndex: testData.scalerIndex})
+		meta, err := parseAwsCloudwatchMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testAWSCloudwatchResolvedEnv, AuthParams: testData.metadataTestData.authParams, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -501,8 +502,8 @@ func TestAWSCloudwatchGetMetricSpecForScaling(t *testing.T) {
 func TestAWSCloudwatchScalerGetMetrics(t *testing.T) {
 	for _, meta := range awsCloudwatchGetMetricTestData {
 		mockAWSCloudwatchScaler := awsCloudwatchScaler{"", &meta, &mockCloudwatch{}, logr.Discard()}
-		value, _, err := mockAWSCloudwatchScaler.GetMetricsAndActivity(context.Background(), meta.metricsName)
-		switch meta.metricsName {
+		value, _, err := mockAWSCloudwatchScaler.GetMetricsAndActivity(context.Background(), meta.MetricsName)
+		switch meta.MetricsName {
 		case testAWSCloudwatchErrorMetric:
 			assert.Error(t, err, "expect error because of cloudwatch api error")
 		case testAWSCloudwatchNoValueMetric:

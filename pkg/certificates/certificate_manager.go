@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,6 +43,7 @@ type CertManager struct {
 	OperatorService       string
 	MetricsServerService  string
 	WebhookService        string
+	K8sClusterDomain      string
 	CAName                string
 	CAOrganization        string
 	ValidatingWebhookName string
@@ -67,10 +69,10 @@ func (cm CertManager) AddCertificateRotation(ctx context.Context, mgr manager.Ma
 	if err != nil {
 		return err
 	}
-	extraDNSNames := []string{}
-	extraDNSNames = append(extraDNSNames, getDNSNames(cm.OperatorService)...)
-	extraDNSNames = append(extraDNSNames, getDNSNames(cm.WebhookService)...)
-	extraDNSNames = append(extraDNSNames, getDNSNames(cm.MetricsServerService)...)
+	var extraDNSNames []string
+	extraDNSNames = append(extraDNSNames, getDNSNames(cm.OperatorService, cm.K8sClusterDomain)...)
+	extraDNSNames = append(extraDNSNames, getDNSNames(cm.WebhookService, cm.K8sClusterDomain)...)
+	extraDNSNames = append(extraDNSNames, getDNSNames(cm.MetricsServerService, cm.K8sClusterDomain)...)
 
 	cm.Logger.V(1).Info("setting up cert rotation")
 	err = rotator.AddRotator(mgr, &rotator.CertRotator{
@@ -96,39 +98,36 @@ func (cm CertManager) AddCertificateRotation(ctx context.Context, mgr manager.Ma
 }
 
 // getDNSNames  creates all the possible DNS names for a given service
-func getDNSNames(service string) []string {
+func getDNSNames(service, k8sClusterDomain string) []string {
 	namespace := kedautil.GetPodNamespace()
 	return []string{
 		service,
 		fmt.Sprintf("%s.%s", service, namespace),
 		fmt.Sprintf("%s.%s.svc", service, namespace),
-		fmt.Sprintf("%s.%s.svc.local", service, namespace),
-		fmt.Sprintf("%s.%s.svc.cluster.local", service, namespace),
+		fmt.Sprintf("%s.%s.svc.%s", service, namespace, k8sClusterDomain),
 	}
 }
 
 // ensureSecret ensures that the secret used for storing TLS certificates exists
 func (cm CertManager) ensureSecret(ctx context.Context, mgr manager.Manager, secretName string) error {
-	secrets := &corev1.SecretList{}
+	secret := &corev1.Secret{}
 	kedaNamespace := kedautil.GetPodNamespace()
-	opt := &client.ListOptions{
+	objKey := client.ObjectKey{
 		Namespace: kedaNamespace,
+		Name:      secretName,
 	}
-
-	err := mgr.GetAPIReader().List(ctx, secrets, opt)
+	create := false
+	err := mgr.GetAPIReader().Get(ctx, objKey, secret)
 	if err != nil {
-		cm.Logger.Error(err, "unable to check secrets")
-		return err
-	}
-
-	exists := false
-	for _, secret := range secrets.Items {
-		if secret.Name == secretName {
-			exists = true
-			break
+		if errors.IsNotFound(err) {
+			create = true
+		} else {
+			cm.Logger.Error(err, "unable to check secret")
+			return err
 		}
 	}
-	if !exists {
+
+	if create {
 		secret := &corev1.Secret{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      secretName,

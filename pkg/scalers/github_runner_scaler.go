@@ -15,6 +15,7 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -43,7 +44,7 @@ type githubRunnerMetadata struct {
 	repos                     []string
 	labels                    []string
 	targetWorkflowQueueLength int64
-	scalerIndex               int
+	triggerIndex              int
 	applicationID             *int64
 	installationID            *int64
 	applicationKey            *string
@@ -325,7 +326,7 @@ type Job struct {
 }
 
 // NewGitHubRunnerScaler creates a new GitHub Runner Scaler
-func NewGitHubRunnerScaler(config *ScalerConfig) (Scaler, error) {
+func NewGitHubRunnerScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	httpClient := kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false)
 
 	metricType, err := GetMetricTargetType(config)
@@ -344,6 +345,7 @@ func NewGitHubRunnerScaler(config *ScalerConfig) (Scaler, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error creating GitHub App client: %w, \n appID: %d, instID: %d", err, meta.applicationID, meta.installationID)
 		}
+		hc.BaseURL = meta.githubAPIURL
 		httpClient = &http.Client{Transport: hc}
 	}
 
@@ -366,7 +368,7 @@ func getValueFromMetaOrEnv(key string, metadata map[string]string, env map[strin
 }
 
 // getInt64ValueFromMetaOrEnv returns the value of the given key from the metadata or the environment variables
-func getInt64ValueFromMetaOrEnv(key string, config *ScalerConfig) (int64, error) {
+func getInt64ValueFromMetaOrEnv(key string, config *scalersconfig.ScalerConfig) (int64, error) {
 	sInt, err := getValueFromMetaOrEnv(key, config.TriggerMetadata, config.ResolvedEnv)
 	if err != nil {
 		return -1, fmt.Errorf("error parsing %s: %w", key, err)
@@ -379,7 +381,7 @@ func getInt64ValueFromMetaOrEnv(key string, config *ScalerConfig) (int64, error)
 	return goodInt, nil
 }
 
-func parseGitHubRunnerMetadata(config *ScalerConfig) (*githubRunnerMetadata, error) {
+func parseGitHubRunnerMetadata(config *scalersconfig.ScalerConfig) (*githubRunnerMetadata, error) {
 	meta := &githubRunnerMetadata{}
 	meta.targetWorkflowQueueLength = defaultTargetWorkflowQueueLength
 
@@ -432,12 +434,12 @@ func parseGitHubRunnerMetadata(config *ScalerConfig) (*githubRunnerMetadata, err
 		return nil, fmt.Errorf("no personalAccessToken or appKey given")
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	return meta, nil
 }
 
-func setupGitHubApp(config *ScalerConfig) (*int64, *int64, *string, error) {
+func setupGitHubApp(config *scalersconfig.ScalerConfig) (*int64, *int64, *string, error) {
 	var appID *int64
 	var instID *int64
 	var appKey *string
@@ -468,31 +470,44 @@ func (s *githubRunnerScaler) getRepositories(ctx context.Context) ([]string, err
 		return s.metadata.repos, nil
 	}
 
-	var url string
-	switch s.metadata.runnerScope {
-	case ORG:
-		url = fmt.Sprintf("%s/orgs/%s/repos", s.metadata.githubAPIURL, s.metadata.owner)
-	case REPO:
-		url = fmt.Sprintf("%s/users/%s/repos", s.metadata.githubAPIURL, s.metadata.owner)
-	case ENT:
-		url = fmt.Sprintf("%s/orgs/%s/repos", s.metadata.githubAPIURL, s.metadata.owner)
-	default:
-		return nil, fmt.Errorf("runnerScope %s not supported", s.metadata.runnerScope)
-	}
-	body, _, err := getGithubRequest(ctx, url, s.metadata, s.httpClient)
-	if err != nil {
-		return nil, err
-	}
-
-	var repos []Repo
-	err = json.Unmarshal(body, &repos)
-	if err != nil {
-		return nil, err
-	}
-
+	page := 1
 	var repoList []string
-	for _, repo := range repos {
-		repoList = append(repoList, repo.Name)
+
+	for {
+		var url string
+		switch s.metadata.runnerScope {
+		case ORG:
+			url = fmt.Sprintf("%s/orgs/%s/repos?page=%s", s.metadata.githubAPIURL, s.metadata.owner, strconv.Itoa(page))
+		case REPO:
+			url = fmt.Sprintf("%s/users/%s/repos?page=%s", s.metadata.githubAPIURL, s.metadata.owner, strconv.Itoa(page))
+		case ENT:
+			url = fmt.Sprintf("%s/orgs/%s/repos?page=%s", s.metadata.githubAPIURL, s.metadata.owner, strconv.Itoa(page))
+		default:
+			return nil, fmt.Errorf("runnerScope %s not supported", s.metadata.runnerScope)
+		}
+
+		body, _, err := getGithubRequest(ctx, url, s.metadata, s.httpClient)
+		if err != nil {
+			return nil, err
+		}
+
+		var repos []Repo
+
+		err = json.Unmarshal(body, &repos)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, repo := range repos {
+			repoList = append(repoList, repo.Name)
+		}
+
+		// GitHub returned less than 30 repos per page, so consider no repos left
+		if len(repos) < 30 {
+			break
+		}
+
+		page++
 	}
 
 	return repoList, nil
@@ -542,7 +557,7 @@ func stripDeadRuns(allWfrs []WorkflowRuns) []WorkflowRun {
 	var filtered []WorkflowRun
 	for _, wfrs := range allWfrs {
 		for _, wfr := range wfrs.WorkflowRuns {
-			if wfr.Status == "queued" {
+			if wfr.Status == "queued" || wfr.Status == "in_progress" {
 				filtered = append(filtered, wfr)
 			}
 		}
@@ -636,7 +651,7 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 			return -1, err
 		}
 		for _, job := range jobs {
-			if job.Status == "queued" && canRunnerMatchLabels(job.Labels, s.metadata.labels) {
+			if (job.Status == "queued" || job.Status == "in_progress") && canRunnerMatchLabels(job.Labels, s.metadata.labels) {
 				queueCount++
 			}
 		}
@@ -661,7 +676,7 @@ func (s *githubRunnerScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 func (s *githubRunnerScaler) GetMetricSpecForScaling(_ context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("github-runner-%s", s.metadata.owner))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("github-runner-%s", s.metadata.owner))),
 		},
 		Target: GetMetricTarget(s.metricType, s.metadata.targetWorkflowQueueLength),
 	}
@@ -670,5 +685,8 @@ func (s *githubRunnerScaler) GetMetricSpecForScaling(_ context.Context) []v2.Met
 }
 
 func (s *githubRunnerScaler) Close(_ context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }

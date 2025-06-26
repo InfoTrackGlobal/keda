@@ -6,11 +6,11 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const (
@@ -53,33 +53,31 @@ type parseAWSSQSMetadataTestData struct {
 
 type awsSQSMetricIdentifier struct {
 	metadataTestData *parseAWSSQSMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
 type mockSqs struct {
-	sqsiface.SQSAPI
 }
 
-func (m *mockSqs) GetQueueAttributes(input *sqs.GetQueueAttributesInput) (*sqs.GetQueueAttributesOutput, error) {
+func (m *mockSqs) GetQueueAttributes(_ context.Context, input *sqs.GetQueueAttributesInput, _ ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error) {
 	switch *input.QueueUrl {
 	case testAWSSQSErrorQueueURL:
 		return nil, errors.New("some error")
 	case testAWSSQSBadDataQueueURL:
 		return &sqs.GetQueueAttributesOutput{
-			Attributes: map[string]*string{
-				"ApproximateNumberOfMessages":           aws.String("NotInt"),
-				"ApproximateNumberOfMessagesNotVisible": aws.String("NotInt"),
-				"ApproximateNumberOfMessagesDelayed":    aws.String("NotInt"),
+			Attributes: map[string]string{
+				"ApproximateNumberOfMessages":           "NotInt",
+				"ApproximateNumberOfMessagesNotVisible": "NotInt",
 			},
 		}, nil
 	}
 
 	return &sqs.GetQueueAttributesOutput{
-		Attributes: map[string]*string{
-			"ApproximateNumberOfMessages":           aws.String(strconv.Itoa(testAWSSQSApproximateNumberOfMessagesVisible)),
-			"ApproximateNumberOfMessagesNotVisible": aws.String(strconv.Itoa(testAWSSQSApproximateNumberOfMessagesNotVisible)),
-			"ApproximateNumberOfMessagesDelayed":    aws.String(strconv.Itoa(testAWSSQSApproximateNumberOfMessagesDelayed)),
+		Attributes: map[string]string{
+			"ApproximateNumberOfMessages":           strconv.Itoa(testAWSSQSApproximateNumberOfMessagesVisible),
+			"ApproximateNumberOfMessagesNotVisible": strconv.Itoa(testAWSSQSApproximateNumberOfMessagesNotVisible),
+			"ApproximateNumberOfMessagesDelayed":    strconv.Itoa(testAWSSQSApproximateNumberOfMessagesDelayed),
 		},
 	}, nil
 }
@@ -393,7 +391,7 @@ var awsSQSGetMetricTestData = []*parseAWSSQSMetadataTestData{
 
 func TestSQSParseMetadata(t *testing.T) {
 	for _, testData := range testAWSSQSMetadata {
-		_, err := parseAwsSqsQueueMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams}, logr.Discard())
+		_, err := parseAwsSqsQueueMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams}, logr.Discard())
 		if err != nil && !testData.isError {
 			t.Errorf("Expected success because %s got error, %s", testData.comment, err)
 		}
@@ -406,7 +404,7 @@ func TestSQSParseMetadata(t *testing.T) {
 func TestAWSSQSGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range awsSQSMetricIdentifiers {
 		ctx := context.Background()
-		meta, err := parseAwsSqsQueueMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testData.metadataTestData.resolvedEnv, AuthParams: testData.metadataTestData.authParams, ScalerIndex: testData.scalerIndex}, logr.Discard())
+		meta, err := parseAwsSqsQueueMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testData.metadataTestData.resolvedEnv, AuthParams: testData.metadataTestData.authParams, TriggerIndex: testData.triggerIndex}, logr.Discard())
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -422,7 +420,7 @@ func TestAWSSQSGetMetricSpecForScaling(t *testing.T) {
 
 func TestAWSSQSScalerGetMetrics(t *testing.T) {
 	for index, testData := range awsSQSGetMetricTestData {
-		meta, err := parseAwsSqsQueueMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams, ScalerIndex: index}, logr.Discard())
+		meta, err := parseAwsSqsQueueMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams, TriggerIndex: index}, logr.Discard())
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -436,15 +434,12 @@ func TestAWSSQSScalerGetMetrics(t *testing.T) {
 			assert.Error(t, err, "expect error because of bad data return from sqs")
 		default:
 			expectedMessages := testAWSSQSApproximateNumberOfMessagesVisible
-
 			if meta.scaleOnInFlight {
 				expectedMessages += testAWSSQSApproximateNumberOfMessagesNotVisible
 			}
-
 			if meta.scaleOnDelayed {
 				expectedMessages += testAWSSQSApproximateNumberOfMessagesDelayed
 			}
-
 			assert.EqualValues(t, int64(expectedMessages), value[0].Value.Value())
 		}
 	}

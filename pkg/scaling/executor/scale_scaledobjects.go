@@ -19,6 +19,7 @@ package executor
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,12 +30,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
-	kedacontrollerutil "github.com/kedacore/keda/v2/controllers/keda/util"
 	"github.com/kedacore/keda/v2/pkg/eventreason"
 	kedastatus "github.com/kedacore/keda/v2/pkg/status"
 )
 
-func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1alpha1.ScaledObject, isActive bool, isError bool) {
+func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1alpha1.ScaledObject, isActive bool, isError bool, options *ScaleExecutorOptions) {
 	logger := e.logger.WithValues("scaledobject.Name", scaledObject.Name,
 		"scaledObject.Namespace", scaledObject.Namespace,
 		"scaleTarget.Name", scaledObject.Spec.ScaleTargetRef.Name)
@@ -75,7 +75,7 @@ func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1al
 	readyCondition := scaledObject.Status.Conditions.GetReadyCondition()
 	if !isError && !readyCondition.IsTrue() {
 		if err := e.setReadyCondition(ctx, logger, scaledObject, metav1.ConditionTrue,
-			kedav1alpha1.ScaledObjectConditionReadySucccesReason, kedav1alpha1.ScaledObjectConditionReadySuccessMessage); err != nil {
+			kedav1alpha1.ScaledObjectConditionReadySuccessReason, kedav1alpha1.ScaledObjectConditionReadySuccessMessage); err != nil {
 			logger.Error(err, "error setting ready condition")
 		}
 	}
@@ -84,7 +84,7 @@ func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1al
 	pausedCount, err := GetPausedReplicaCount(scaledObject)
 	if err != nil {
 		if err := e.setReadyCondition(ctx, logger, scaledObject, metav1.ConditionFalse,
-			kedav1alpha1.ScaledObjectConditionReadySucccesReason, kedav1alpha1.ScaledObjectConditionReadySuccessMessage); err != nil {
+			kedav1alpha1.ScaledObjectConditionReadySuccessReason, kedav1alpha1.ScaledObjectConditionReadySuccessMessage); err != nil {
 			logger.Error(err, "error setting ready condition")
 		}
 		logger.Error(err, "error getting the paused replica count on the current ScaledObject.")
@@ -98,7 +98,7 @@ func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1al
 			if err != nil {
 				logger.Error(err, "error scaling target to paused replicas count", "paused replicas", *pausedCount)
 				if err := e.setReadyCondition(ctx, logger, scaledObject, metav1.ConditionUnknown,
-					kedav1alpha1.ScaledObjectConditionReadySucccesReason, kedav1alpha1.ScaledObjectConditionReadySuccessMessage); err != nil {
+					kedav1alpha1.ScaledObjectConditionReadySuccessReason, kedav1alpha1.ScaledObjectConditionReadySuccessMessage); err != nil {
 					logger.Error(err, "error setting ready condition")
 				}
 				return
@@ -135,7 +135,7 @@ func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1al
 			// replica count is equal to 0
 
 			// Scale the ScaleTarget up
-			e.scaleFromZeroOrIdle(ctx, logger, scaledObject, currentScale)
+			e.scaleFromZeroOrIdle(ctx, logger, scaledObject, currentScale, options.ActiveTriggers)
 		case isError:
 			// some triggers are active, but some responded with error
 
@@ -253,12 +253,18 @@ func (e *scaleExecutor) scaleToZeroOrIdle(ctx context.Context, logger logr.Logge
 		cooldownPeriod = time.Second * time.Duration(defaultCooldownPeriod)
 	}
 
+	initialCooldownPeriod := time.Second * time.Duration(scaledObject.Spec.InitialCooldownPeriod)
+
+	// If the ScaledObject was just created,CreationTimestamp is zero, set the CreationTimestamp to now
+	if scaledObject.ObjectMeta.CreationTimestamp.IsZero() {
+		scaledObject.ObjectMeta.CreationTimestamp = metav1.NewTime(time.Now())
+	}
+
 	// LastActiveTime can be nil if the ScaleTarget was scaled outside of KEDA.
 	// In this case we will ignore the cooldown period and scale it down
-	if scaledObject.Status.LastActiveTime == nil ||
-		scaledObject.Status.LastActiveTime.Add(cooldownPeriod).Before(time.Now()) {
+	if (scaledObject.Status.LastActiveTime == nil && scaledObject.ObjectMeta.CreationTimestamp.Add(initialCooldownPeriod).Before(time.Now())) || (scaledObject.Status.LastActiveTime != nil &&
+		scaledObject.Status.LastActiveTime.Add(cooldownPeriod).Before(time.Now())) {
 		// or last time a trigger was active was > cooldown period, so scale in.
-
 		idleValue, scaleToReplicas := getIdleOrMinimumReplicaCount(scaledObject)
 
 		currentReplicas, err := e.updateScaleOnScaleTarget(ctx, scaledObject, scale, scaleToReplicas)
@@ -296,7 +302,7 @@ func (e *scaleExecutor) scaleToZeroOrIdle(ctx context.Context, logger logr.Logge
 	}
 }
 
-func (e *scaleExecutor) scaleFromZeroOrIdle(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, scale *autoscalingv1.Scale) {
+func (e *scaleExecutor) scaleFromZeroOrIdle(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, scale *autoscalingv1.Scale, activeTriggers []string) {
 	var replicas int32
 	if scaledObject.Spec.MinReplicaCount != nil && *scaledObject.Spec.MinReplicaCount > 0 {
 		replicas = *scaledObject.Spec.MinReplicaCount
@@ -310,7 +316,7 @@ func (e *scaleExecutor) scaleFromZeroOrIdle(ctx context.Context, logger logr.Log
 		logger.Info("Successfully updated ScaleTarget",
 			"Original Replicas Count", currentReplicas,
 			"New Replicas Count", replicas)
-		e.recorder.Eventf(scaledObject, corev1.EventTypeNormal, eventreason.KEDAScaleTargetActivated, "Scaled %s %s/%s from %d to %d", scaledObject.Status.ScaleTargetKind, scaledObject.Namespace, scaledObject.Spec.ScaleTargetRef.Name, currentReplicas, replicas)
+		e.recorder.Eventf(scaledObject, corev1.EventTypeNormal, eventreason.KEDAScaleTargetActivated, "Scaled %s %s/%s from %d to %d, triggered by %s", scaledObject.Status.ScaleTargetKind, scaledObject.Namespace, scaledObject.Spec.ScaleTargetRef.Name, currentReplicas, replicas, strings.Join(activeTriggers, ";"))
 
 		// Scale was successful. Update lastScaleTime and lastActiveTime on the scaledObject
 		if err := e.updateLastActiveTime(ctx, logger, scaledObject); err != nil {
@@ -362,7 +368,7 @@ func getIdleOrMinimumReplicaCount(scaledObject *kedav1alpha1.ScaledObject) (bool
 // If not paused, it returns nil.
 func GetPausedReplicaCount(scaledObject *kedav1alpha1.ScaledObject) (*int32, error) {
 	if scaledObject.Annotations != nil {
-		if val, ok := scaledObject.Annotations[kedacontrollerutil.PausedReplicasAnnotation]; ok {
+		if val, ok := scaledObject.Annotations[kedav1alpha1.PausedReplicasAnnotation]; ok {
 			conv, err := strconv.ParseInt(val, 10, 32)
 			if err != nil {
 				return nil, err
