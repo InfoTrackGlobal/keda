@@ -1,7 +1,7 @@
 //
 // DISCLAIMER
 //
-// Copyright 2017 ArangoDB GmbH, Cologne, Germany
+// Copyright 2017-2025 ArangoDB GmbH, Cologne, Germany
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@
 // limitations under the License.
 //
 // Copyright holder is ArangoDB GmbH, Cologne, Germany
-//
-// Author Ewout Prangsma
 //
 
 package driver
@@ -53,6 +51,7 @@ func (c *vertexCollection) Indexes(ctx context.Context) ([]Index, error) {
 }
 
 // Deprecated: since 3.10 version. Use ArangoSearch view instead.
+//
 // EnsureFullTextIndex creates a fulltext index in the collection, if it does not already exist.
 //
 // Fields is a slice of attribute names. Currently, the slice is limited to exactly one attribute.
@@ -131,6 +130,22 @@ func (c *vertexCollection) EnsureTTLIndex(ctx context.Context, field string, exp
 // The index is returned, together with a boolean indicating if the index was newly created (true) or pre-existing (false).
 func (c *vertexCollection) EnsureZKDIndex(ctx context.Context, fields []string, options *EnsureZKDIndexOptions) (Index, bool, error) {
 	result, created, err := c.rawCollection().EnsureZKDIndex(ctx, fields, options)
+	if err != nil {
+		return nil, false, WithStack(err)
+	}
+	return result, created, nil
+}
+
+func (c *vertexCollection) EnsureMDIIndex(ctx context.Context, fields []string, options *EnsureMDIIndexOptions) (Index, bool, error) {
+	result, created, err := c.rawCollection().EnsureMDIIndex(ctx, fields, options)
+	if err != nil {
+		return nil, false, WithStack(err)
+	}
+	return result, created, nil
+}
+
+func (c *vertexCollection) EnsureMDIPrefixedIndex(ctx context.Context, fields []string, options *EnsureMDIPrefixedIndexOptions) (Index, bool, error) {
+	result, created, err := c.rawCollection().EnsureMDIPrefixedIndex(ctx, fields, options)
 	if err != nil {
 		return nil, false, WithStack(err)
 	}

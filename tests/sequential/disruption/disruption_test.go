@@ -65,7 +65,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: 'nginxinc/nginx-unprivileged'`
+          image: 'ghcr.io/nginx/nginx-unprivileged:1.26'`
 
 	sutDeploymentTemplate = `apiVersion: apps/v1
 kind: Deployment
@@ -86,7 +86,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: 'nginxinc/nginx-unprivileged'`
+        image: 'ghcr.io/nginx/nginx-unprivileged:1.26'`
 
 	scaledObjectTemplate = `apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -231,7 +231,7 @@ func testScaleIn(t *testing.T, kc *kubernetes.Clientset) {
 }
 
 func saveLogs(t *testing.T, kc *kubernetes.Clientset, logName, selector, namespace string) {
-	logs, err := FindPodLogs(kc, namespace, selector)
+	logs, err := FindPodLogs(kc, namespace, selector, false)
 	assert.NoErrorf(t, err, "cannotget logs - %s", err)
 	f, err := os.Create(fmt.Sprintf("%s-%s.log", logName, time.Now().Format("20060102150405")))
 	assert.NoErrorf(t, err, "cannot create log file - %s", err)

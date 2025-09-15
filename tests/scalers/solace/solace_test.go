@@ -9,6 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -204,12 +205,20 @@ spec:
 )
 
 func TestStanScaler(t *testing.T) {
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
+
+	// Create kubernetes resources
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 	installSolace(t)
 	KubectlApplyWithTemplate(t, data, "scaledObjectTemplate", scaledObjectTemplate)
+
+	t.Cleanup(func() {
+		KubectlDeleteWithTemplate(t, data, "scaledObjectTemplateRate", scaledObjectTemplateRate)
+		uninstallSolace(t)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 1),
 		"replica count should be 0 after 1 minute")
 
@@ -222,26 +231,19 @@ func TestStanScaler(t *testing.T) {
 	testActivationRate(t, kc)
 	testScaleOutRate(t, kc)
 	testScaleInRate(t, kc)
-
-	// cleanup
-	KubectlDeleteWithTemplate(t, data, "scaledObjectTemplateRate", scaledObjectTemplateRate)
-	uninstallSolace(t)
-	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func installSolace(t *testing.T) {
 	_, err := ExecuteCommand("helm repo add solacecharts https://solaceproducts.github.io/pubsubplus-kubernetes-helm-quickstart/helm-charts")
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 	_, err = ExecuteCommand("helm repo update")
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
-	_, err = ExecuteCommand(fmt.Sprintf(`helm upgrade --install --set solace.usernameAdminPassword=KedaLabAdminPwd1 --set storage.persistent=false,solace.size=dev,nameOverride=pubsubplus-dev --namespace %s kedalab solacecharts/pubsubplus`,
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
+	_, err = ExecuteCommand(fmt.Sprintf(`helm upgrade --install --set solace.usernameAdminPassword=KedaLabAdminPwd1 --set storage.persistent=false,solace.size=dev,nameOverride=pubsubplus-dev,service.type=ClusterIP --wait --namespace %s kedalab solacecharts/pubsubplus`,
 		testNamespace))
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
-	_, err = ExecuteCommand("sleep 60") // there is a bug in the solace helm chart where it is looking for the wrong number of replicas on --wait
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 	// Create the pubsub broker
 	_, _, err = ExecCommandOnSpecificPod(t, helperName, testNamespace, "./config/config_solace.sh")
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 }
 
 func uninstallSolace(t *testing.T) {

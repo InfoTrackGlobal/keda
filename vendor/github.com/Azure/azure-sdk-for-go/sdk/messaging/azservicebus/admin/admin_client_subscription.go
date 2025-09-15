@@ -12,7 +12,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/atom"
-	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/auth"
 )
 
 // SubscriptionProperties represents the static properties of the subscription.
@@ -97,6 +96,12 @@ type SubscriptionRuntimeProperties struct {
 
 // CreateSubscriptionResponse contains response fields for Client.CreateSubscription
 type CreateSubscriptionResponse struct {
+	// SubscriptionName is the name of the subscription.
+	SubscriptionName string
+
+	// TopicName is the name of the topic for this subscription.
+	TopicName string
+
 	SubscriptionProperties
 }
 
@@ -121,12 +126,20 @@ func (ac *Client) CreateSubscription(ctx context.Context, topicName string, subs
 	}
 
 	return CreateSubscriptionResponse{
+		SubscriptionName:       subscriptionName,
+		TopicName:              topicName,
 		SubscriptionProperties: *newProps,
 	}, nil
 }
 
 // GetSubscriptionResponse contains response fields for Client.GetSubscription
 type GetSubscriptionResponse struct {
+	// SubscriptionName is the name of the subscription.
+	SubscriptionName string
+
+	// TopicName is the name of the topic for this subscription.
+	TopicName string
+
 	SubscriptionProperties
 }
 
@@ -152,12 +165,20 @@ func (ac *Client) GetSubscription(ctx context.Context, topicName string, subscri
 	}
 
 	return &GetSubscriptionResponse{
+		SubscriptionName:       subscriptionName,
+		TopicName:              topicName,
 		SubscriptionProperties: item.SubscriptionProperties,
 	}, nil
 }
 
 // GetSubscriptionRuntimePropertiesResponse contains response fields for Client.GetSubscriptionRuntimeProperties
 type GetSubscriptionRuntimePropertiesResponse struct {
+	// TopicName is the name of the topic.
+	TopicName string
+
+	// SubscriptionName is the name of the subscription.
+	SubscriptionName string
+
 	SubscriptionRuntimeProperties
 }
 
@@ -183,6 +204,8 @@ func (ac *Client) GetSubscriptionRuntimeProperties(ctx context.Context, topicNam
 	}
 
 	return &GetSubscriptionRuntimePropertiesResponse{
+		TopicName:                     topicName,
+		SubscriptionName:              subscriptionName,
 		SubscriptionRuntimeProperties: item.SubscriptionRuntimeProperties,
 	}, nil
 }
@@ -197,7 +220,10 @@ type ListSubscriptionsOptions struct {
 type SubscriptionPropertiesItem struct {
 	SubscriptionProperties
 
-	TopicName        string
+	// TopicName is the name of the topic.
+	TopicName string
+
+	// SubscriptionName is the name of the subscription.
 	SubscriptionName string
 }
 
@@ -252,7 +278,10 @@ type ListSubscriptionsRuntimePropertiesOptions struct {
 type SubscriptionRuntimePropertiesItem struct {
 	SubscriptionRuntimeProperties
 
-	TopicName        string
+	// TopicName is the name of the topic.
+	TopicName string
+
+	// SubscriptionName is the name of the subscription.
 	SubscriptionName string
 }
 
@@ -299,6 +328,12 @@ func (ac *Client) NewListSubscriptionsRuntimePropertiesPager(topicName string, o
 
 // UpdateSubscriptionResponse contains the response fields for Client.UpdateSubscription
 type UpdateSubscriptionResponse struct {
+	// TopicName is the name of the topic.
+	TopicName string
+
+	// SubscriptionName is the name of the subscription.
+	SubscriptionName string
+
 	SubscriptionProperties
 }
 
@@ -316,6 +351,8 @@ func (ac *Client) UpdateSubscription(ctx context.Context, topicName string, subs
 	}
 
 	return UpdateSubscriptionResponse{
+		TopicName:              topicName,
+		SubscriptionName:       subscriptionName,
 		SubscriptionProperties: *newProps,
 	}, nil
 }
@@ -341,8 +378,7 @@ func (ac *Client) createOrUpdateSubscriptionImpl(ctx context.Context, topicName 
 		props = &SubscriptionProperties{}
 	}
 
-	env, err := newSubscriptionEnvelope(props, ac.em.TokenProvider())
-
+	env, err := newSubscriptionEnvelope(props)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -374,7 +410,7 @@ func (ac *Client) createOrUpdateSubscriptionImpl(ctx context.Context, topicName 
 	return &item.SubscriptionProperties, resp, nil
 }
 
-func newSubscriptionEnvelope(props *SubscriptionProperties, tokenProvider auth.TokenProvider) (*atom.SubscriptionEnvelope, error) {
+func newSubscriptionEnvelope(props *SubscriptionProperties) (*atom.SubscriptionEnvelope, error) {
 	defaultRuleDescription, err := newDefaultRuleDescription(props.DefaultRule)
 
 	if err != nil {

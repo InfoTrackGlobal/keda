@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type metricsAPIMetadataTestData struct {
@@ -73,11 +76,13 @@ var testMetricsAPIAuthMetadata = []metricAPIAuthMetadataTestData{
 	{map[string]string{"url": "http://dummy:1230/api/v1/", "valueLocation": "metric", "targetValue": "42", "unsafeSsl": "false"}, map[string]string{}, false},
 	// failed unsafeSsl non bool
 	{map[string]string{"url": "http://dummy:1230/api/v1/", "valueLocation": "metric", "targetValue": "42", "unsafeSsl": "yes"}, map[string]string{}, true},
+	// success with both apiKey and TLS authentication
+	{map[string]string{"url": "http://dummy:1230/api/v1/", "valueLocation": "metric", "targetValue": "42", "authMode": "apiKey,tls"}, map[string]string{"apiKey": "apiikey", "ca": "caaa", "cert": "ceert", "key": "keey"}, false},
 }
 
 func TestParseMetricsAPIMetadata(t *testing.T) {
 	for _, testData := range testMetricsAPIMetadata {
-		_, err := parseMetricsAPIMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: map[string]string{}})
+		_, err := parseMetricsAPIMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: map[string]string{}})
 		if err != nil && !testData.raisesError {
 			t.Error("Expected success but got error", err)
 		}
@@ -89,23 +94,23 @@ func TestParseMetricsAPIMetadata(t *testing.T) {
 
 type metricsAPIMetricIdentifier struct {
 	metadataTestData *metricsAPIMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
 var metricsAPIMetricIdentifiers = []metricsAPIMetricIdentifier{
-	{metadataTestData: &testMetricsAPIMetadata[1], scalerIndex: 1, name: "s1-metric-api-metric-test"},
+	{metadataTestData: &testMetricsAPIMetadata[1], triggerIndex: 1, name: "s1-metric-api-metric-test"},
 }
 
 func TestMetricsAPIGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range metricsAPIMetricIdentifiers {
 		s, err := NewMetricsAPIScaler(
-			&ScalerConfig{
+			&scalersconfig.ScalerConfig{
 				ResolvedEnv:       map[string]string{},
 				TriggerMetadata:   testData.metadataTestData.metadata,
 				AuthParams:        map[string]string{},
 				GlobalHTTPTimeout: 3000 * time.Millisecond,
-				ScalerIndex:       testData.scalerIndex,
+				TriggerIndex:      testData.triggerIndex,
 			},
 		)
 		if err != nil {
@@ -121,48 +126,61 @@ func TestMetricsAPIGetMetricSpecForScaling(t *testing.T) {
 }
 
 func TestGetValueFromResponse(t *testing.T) {
-	d := []byte(`{"components":[{"id": "82328e93e", "tasks": 32, "str": "64", "k":"1k","wrong":"NaN"}],"count":2.43}`)
-	v, err := GetValueFromResponse(d, "components.0.tasks")
-	if err != nil {
-		t.Error("Expected success but got error", err)
-	}
-	if v != 32 {
-		t.Errorf("Expected %d got %f", 32, v)
+	inputJSON := []byte(`{"components":[{"id": "82328e93e", "tasks": 32, "str": "64", "k":"1k","wrong":"NaN"}],"count":2.43}`)
+	inputYAML := []byte(`{components: [{id: 82328e93e, tasks: 32, str: '64', k: 1k, wrong: NaN}], count: 2.43}`)
+	inputPrometheus := []byte(`# HELP backend_queue_size Total number of items
+	# TYPE backend_queue_size counter
+	backend_queue_size{queueName="zero"} 0
+	backend_queue_size{queueName="one"} 1
+	backend_queue_size{queueName="two", instance="random"} 2
+	backend_queue_size{queueName="two", instance="zero"} 20
+	# HELP random_metric Random metric generate to include noise
+	# TYPE random_metric counter
+	random_metric 10`)
+	// Ending the file without new line is intended to verify
+	// https://github.com/kedacore/keda/issues/6559
+
+	testCases := []struct {
+		name      string
+		input     []byte
+		key       string
+		format    APIFormat
+		expectVal float64
+		expectErr bool
+	}{
+		{name: "integer", input: inputJSON, key: "count", format: JSONFormat, expectVal: 2.43},
+		{name: "string", input: inputJSON, key: "components.0.str", format: JSONFormat, expectVal: 64},
+		{name: "{}.[].{}", input: inputJSON, key: "components.0.tasks", format: JSONFormat, expectVal: 32},
+		{name: "invalid data", input: inputJSON, key: "components.0.wrong", format: JSONFormat, expectErr: true},
+
+		{name: "integer", input: inputYAML, key: "count", format: YAMLFormat, expectVal: 2.43},
+		{name: "string", input: inputYAML, key: "components.0.str", format: YAMLFormat, expectVal: 64},
+		{name: "{}.[].{}", input: inputYAML, key: "components.0.tasks", format: YAMLFormat, expectVal: 32},
+		{name: "invalid data", input: inputYAML, key: "components.0.wrong", format: YAMLFormat, expectErr: true},
+
+		{name: "no labels", input: inputPrometheus, key: "random_metric", format: PrometheusFormat, expectVal: 10},
+		{name: "one label", input: inputPrometheus, key: "backend_queue_size{queueName=\"one\"}", format: PrometheusFormat, expectVal: 1},
+		{name: "multiple labels not queried", input: inputPrometheus, key: "backend_queue_size{queueName=\"two\"}", format: PrometheusFormat, expectVal: 2},
+		{name: "multiple labels queried", input: inputPrometheus, key: "backend_queue_size{queueName=\"two\", instance=\"zero\"}", format: PrometheusFormat, expectVal: 20},
+		{name: "invalid data", input: inputPrometheus, key: "backend_queue_size{invalid=test}", format: PrometheusFormat, expectErr: true},
 	}
 
-	v, err = GetValueFromResponse(d, "count")
-	if err != nil {
-		t.Error("Expected success but got error", err)
-	}
-	if v != 2.43 {
-		t.Errorf("Expected %d got %f", 2, v)
-	}
+	for _, tc := range testCases {
+		t.Run(string(tc.format)+": "+tc.name, func(t *testing.T) {
+			v, err := GetValueFromResponse(tc.input, tc.key, tc.format)
 
-	v, err = GetValueFromResponse(d, "components.0.str")
-	if err != nil {
-		t.Error("Expected success but got error", err)
-	}
-	if v != 64 {
-		t.Errorf("Expected %d got %f", 64, v)
-	}
+			if tc.expectErr {
+				assert.Error(t, err)
+			}
 
-	v, err = GetValueFromResponse(d, "components.0.k")
-	if err != nil {
-		t.Error("Expected success but got error", err)
-	}
-	if v != 1000 {
-		t.Errorf("Expected %d got %f", 1000, v)
-	}
-
-	_, err = GetValueFromResponse(d, "components.0.wrong")
-	if err == nil {
-		t.Error("Expected error but got success", err)
+			assert.EqualValues(t, tc.expectVal, v)
+		})
 	}
 }
 
 func TestMetricAPIScalerAuthParams(t *testing.T) {
 	for _, testData := range testMetricsAPIAuthMetadata {
-		meta, err := parseMetricsAPIMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		meta, err := parseMetricsAPIMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
@@ -172,14 +190,50 @@ func TestMetricAPIScalerAuthParams(t *testing.T) {
 		}
 
 		if err == nil {
-			if (meta.enableAPIKeyAuth && !(testData.metadata["authMode"] == "apiKey")) ||
-				(meta.enableBaseAuth && !(testData.metadata["authMode"] == "basic")) ||
-				(meta.enableTLS && !(testData.metadata["authMode"] == "tls")) ||
-				(meta.enableBearerAuth && !(testData.metadata["authMode"] == "bearer")) {
-				t.Error("wrong auth mode detected")
+			authModes := strings.Split(testData.metadata["authMode"], ",")
+
+			// Check if each enabled auth method is present in the authModes
+			if meta.enableAPIKeyAuth && !containsAuthMode(authModes, "apiKey") {
+				t.Error("API Key auth enabled but not in authMode")
+			}
+			if meta.enableBaseAuth && !containsAuthMode(authModes, "basic") {
+				t.Error("Basic auth enabled but not in authMode")
+			}
+			if meta.enableTLS && !containsAuthMode(authModes, "tls") {
+				t.Error("TLS auth enabled but not in authMode")
+			}
+			if meta.enableBearerAuth && !containsAuthMode(authModes, "bearer") {
+				t.Error("Bearer auth enabled but not in authMode")
+			}
+
+			// Check if each auth mode in authModes is enabled
+			for _, mode := range authModes {
+				mode = strings.TrimSpace(mode)
+				if mode == "apiKey" && !meta.enableAPIKeyAuth {
+					t.Error("apiKey in authMode but not enabled")
+				}
+				if mode == "basic" && !meta.enableBaseAuth {
+					t.Error("basic in authMode but not enabled")
+				}
+				if mode == "tls" && !meta.enableTLS {
+					t.Error("tls in authMode but not enabled")
+				}
+				if mode == "bearer" && !meta.enableBearerAuth {
+					t.Error("bearer in authMode but not enabled")
+				}
 			}
 		}
 	}
+}
+
+// Helper function to check if an auth mode is in the list
+func containsAuthMode(modes []string, mode string) bool {
+	for _, m := range modes {
+		if strings.TrimSpace(m) == mode {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBearerAuth(t *testing.T) {
@@ -208,7 +262,7 @@ func TestBearerAuth(t *testing.T) {
 	}
 
 	s, err := NewMetricsAPIScaler(
-		&ScalerConfig{
+		&scalersconfig.ScalerConfig{
 			ResolvedEnv:       map[string]string{},
 			TriggerMetadata:   metadata,
 			AuthParams:        authentication,
@@ -243,8 +297,8 @@ func TestGetMetricValueErrorMessage(t *testing.T) {
 
 	httpClient := http.Client{Transport: &mockHTTPRoundTripper}
 	s := metricsAPIScaler{
-		metadata: &metricsAPIScalerMetadata{url: "http://dummy:1230/api/v1/"},
-		client:   &httpClient,
+		metadata:   &metricsAPIScalerMetadata{url: "http://dummy:1230/api/v1/"},
+		httpClient: &httpClient,
 	}
 
 	_, err := s.getMetricValue(context.TODO())

@@ -89,6 +89,7 @@ type Message struct {
 
 	// Value payload.
 	// An amqp-value section contains a single AMQP value.
+	// To send an AMQP null, populate with a [Null].
 	Value any
 
 	// Sequence will contain AMQP sequence sections from the body of the message.
@@ -101,8 +102,9 @@ type Message struct {
 	// encryption details).
 	Footer Annotations
 
-	deliveryID uint32 // used when sending disposition
-	settled    bool   // whether transfer was settled by sender
+	deliveryID uint32    // used when sending disposition
+	settled    bool      // whether transfer was settled by sender
+	rcv        *Receiver // used to settle message on the corresponding Receiver (nil if settled == true)
 }
 
 // NewMessage returns a *Message with data as the first payload in the Data field.
@@ -117,6 +119,17 @@ func NewMessage(data []byte) *Message {
 	return &Message{
 		Data: [][]byte{data},
 	}
+}
+
+// Null is an AMQP null.
+// Typically used in [Message.Value] to send a null.
+//
+// https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-types-v1.0-os.html#type-null
+type Null struct{}
+
+func (n Null) Marshal(wr *buffer.Buffer) error {
+	wr.AppendByte(byte(encoding.TypeCodeNull))
+	return nil
 }
 
 // GetData returns the first []byte from the Data field
@@ -299,6 +312,11 @@ func (m *Message) Unmarshal(r *buffer.Buffer) error {
 	return nil
 }
 
+func (m *Message) onSettlement() {
+	m.settled = true
+	m.rcv = nil
+}
+
 /*
 <type name="header" class="composite" source="list" provides="section">
     <descriptor name="amqp:header:list" code="0x00000000:0x00000070"/>
@@ -322,7 +340,7 @@ type MessageHeader struct {
 
 func (h *MessageHeader) Marshal(wr *buffer.Buffer) error {
 	return encoding.MarshalComposite(wr, encoding.TypeCodeMessageHeader, []encoding.MarshalField{
-		{Value: &h.Durable, Omit: !h.Durable},
+		{Value: &h.Durable},
 		{Value: &h.Priority, Omit: h.Priority == 4},
 		{Value: (*encoding.Milliseconds)(&h.TTL), Omit: h.TTL == 0},
 		{Value: &h.FirstAcquirer, Omit: !h.FirstAcquirer},
@@ -492,3 +510,6 @@ type Annotations = encoding.Annotations
 
 // UUID is a 128 bit identifier as defined in RFC 4122.
 type UUID = encoding.UUID
+
+// Symbol is an AMQP symbolic string.
+type Symbol = encoding.Symbol

@@ -79,7 +79,7 @@ func getDataExplorerAuthConfig(metadata *DataExplorerMetadata) (*kusto.Connectio
 			return nil, fmt.Errorf("missing credentials. please ensure that TenantID is provided")
 		}
 		kcsb.WithAadAppKey(metadata.ClientID, metadata.ClientSecret, metadata.TenantID)
-		// This should be here because internaly the SDK resets the configuration
+		// This should be here because internally the SDK resets the configuration
 		// after calling `WithAadAppKey`
 		clientOptions := &policy.ClientOptions{
 			Cloud: cloud.Configuration{
@@ -89,15 +89,13 @@ func getDataExplorerAuthConfig(metadata *DataExplorerMetadata) (*kusto.Connectio
 		}
 		kcsb.AttachPolicyClientOptions(clientOptions)
 
-	case kedav1alpha1.PodIdentityProviderAzure, kedav1alpha1.PodIdentityProviderAzureWorkload:
+	case kedav1alpha1.PodIdentityProviderAzureWorkload:
 		azureDataExplorerLogger.V(1).Info(fmt.Sprintf("Creating Azure Data Explorer Client using podIdentity %s", metadata.PodIdentity.Provider))
-		creds, chainedErr := NewChainedCredential(metadata.PodIdentity.GetIdentityID(), metadata.PodIdentity.Provider)
+		creds, chainedErr := NewChainedCredential(azureDataExplorerLogger, metadata.PodIdentity)
 		if chainedErr != nil {
 			return nil, chainedErr
 		}
 		kcsb.WithTokenCredential(creds)
-		// We don't need to call to kcsb.AttachPolicyClientOptions because WI/AAD-Pod-Identity manages
-		// it based on their own configurations
 
 	default:
 		return nil, fmt.Errorf("missing credentials. please reconfigure your scaled object metadata")

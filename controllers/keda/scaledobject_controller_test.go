@@ -22,9 +22,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -35,22 +35,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
-	kedacontrollerutil "github.com/kedacore/keda/v2/controllers/keda/util"
 	"github.com/kedacore/keda/v2/pkg/mock/mock_client"
 	"github.com/kedacore/keda/v2/pkg/mock/mock_scaling"
 	"github.com/kedacore/keda/v2/pkg/scalers"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	"github.com/kedacore/keda/v2/pkg/scaling/cache"
+	"github.com/kedacore/keda/v2/pkg/util"
 )
-
-type GinkgoTestReporter struct{}
-
-func (g GinkgoTestReporter) Errorf(format string, args ...interface{}) {
-	Fail(fmt.Sprintf(format, args...))
-}
-
-func (g GinkgoTestReporter) Fatalf(format string, args ...interface{}) {
-	Fail(fmt.Sprintf(format, args...))
-}
 
 var _ = Describe("ScaledObjectController", func() {
 	var (
@@ -71,7 +62,7 @@ var _ = Describe("ScaledObjectController", func() {
 		}
 
 		BeforeEach(func() {
-			ctrl := gomock.NewController(GinkgoTestReporter{})
+			ctrl := gomock.NewController(util.GinkgoTestReporter{})
 			mockScaleHandler = mock_scaling.NewMockScaleHandler(ctrl)
 			mockClient = mock_client.NewMockClient(ctrl)
 			mockStatusWriter = mock_client.NewMockStatusWriter(ctrl)
@@ -91,13 +82,13 @@ var _ = Describe("ScaledObjectController", func() {
 				expectedExternalMetricNames := make([]string, 0)
 
 				for i, tm := range triggerMeta {
-					config := &scalers.ScalerConfig{
+					config := &scalersconfig.ScalerConfig{
 						ScalableObjectName:      fmt.Sprintf("test.%d", i),
 						ScalableObjectNamespace: "test",
 						TriggerMetadata:         tm,
 						ResolvedEnv:             nil,
 						AuthParams:              nil,
-						ScalerIndex:             i,
+						TriggerIndex:            i,
 					}
 
 					s, err := scalers.NewPrometheusScaler(config)
@@ -107,7 +98,7 @@ var _ = Describe("ScaledObjectController", func() {
 
 					testScalers = append(testScalers, cache.ScalerBuilder{
 						Scaler: s,
-						Factory: func() (scalers.Scaler, *scalers.ScalerConfig, error) {
+						Factory: func() (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
 							scaler, err := scalers.NewPrometheusScaler(config)
 							return scaler, config, err
 						},
@@ -143,7 +134,7 @@ var _ = Describe("ScaledObjectController", func() {
 				// Generate test data
 				expectedExternalMetricNames := make([]string, 0)
 
-				config := &scalers.ScalerConfig{
+				config := &scalersconfig.ScalerConfig{
 					ScalableObjectName:      "test",
 					ScalableObjectNamespace: "test",
 					TriggerMetadata:         triggerMeta[0],
@@ -164,7 +155,7 @@ var _ = Describe("ScaledObjectController", func() {
 				scalersCache := cache.ScalersCache{
 					Scalers: []cache.ScalerBuilder{{
 						Scaler: s,
-						Factory: func() (scalers.Scaler, *scalers.ScalerConfig, error) {
+						Factory: func() (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
 							return s, config, nil
 						},
 					}},
@@ -193,7 +184,7 @@ var _ = Describe("ScaledObjectController", func() {
 				// Generate test data
 				testScalers := make([]cache.ScalerBuilder, 0)
 				for i := 0; i < 4; i++ {
-					config := &scalers.ScalerConfig{
+					config := &scalersconfig.ScalerConfig{
 						ScalableObjectName:      fmt.Sprintf("test.%d", i),
 						ScalableObjectNamespace: "test",
 						TriggerMetadata:         triggerMeta[0],
@@ -208,7 +199,7 @@ var _ = Describe("ScaledObjectController", func() {
 
 					testScalers = append(testScalers, cache.ScalerBuilder{
 						Scaler: s,
-						Factory: func() (scalers.Scaler, *scalers.ScalerConfig, error) {
+						Factory: func() (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
 							return s, config, nil
 						},
 					})
@@ -356,6 +347,62 @@ var _ = Describe("ScaledObjectController", func() {
 			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
 			Expect(err).Should(HaveOccurred())
 			Expect(errors.IsNotFound(err)).To(Equal(true))
+		})
+
+		It("sets the hpaName in status if not set and HPA already exists", func() {
+			// Create the scaling target.
+			deploymentName := "hpa-name-update"
+			soName := "so-" + deploymentName
+			err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+			Expect(err).ToNot(HaveOccurred())
+
+			// Create the ScaledObject without specifying name.
+			so := &kedav1alpha1.ScaledObject{
+				ObjectMeta: metav1.ObjectMeta{Name: soName, Namespace: "default"},
+				Spec: kedav1alpha1.ScaledObjectSpec{
+					ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+						Name: deploymentName,
+					},
+					Advanced: &kedav1alpha1.AdvancedConfig{
+						HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+					},
+					Triggers: []kedav1alpha1.ScaleTriggers{
+						{
+							Type: "cron",
+							Metadata: map[string]string{
+								"timezone":        "UTC",
+								"start":           "0 * * * *",
+								"end":             "1 * * * *",
+								"desiredReplicas": "1",
+							},
+						},
+					},
+				},
+			}
+			err = k8sClient.Create(context.Background(), so)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Get and confirm the HPA.
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+			Eventually(func() error {
+				return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+			}).ShouldNot(HaveOccurred())
+			Expect(hpa.Name).To(Equal(fmt.Sprintf("keda-hpa-%s", soName)))
+
+			// Remove the HPA name from the ScaledObject.
+			Eventually(func() error {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Expect(err).ToNot(HaveOccurred())
+				so.Status.HpaName = ""
+				return k8sClient.Status().Update(context.Background(), so)
+			}).ShouldNot(HaveOccurred())
+
+			// Wait until the hpaName is updated in the scaled object.
+			Eventually(func() string {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Expect(err).ToNot(HaveOccurred())
+				return so.Status.HpaName
+			}).WithTimeout(60 * time.Second).WithPolling(2 * time.Second).Should(Equal(fmt.Sprintf("keda-hpa-%s", soName)))
 		})
 
 		//https://github.com/kedacore/keda/issues/2407
@@ -533,6 +580,233 @@ var _ = Describe("ScaledObjectController", func() {
 			}).ShouldNot(HaveOccurred())
 
 			Ω(hpa.Annotations).To(Equal(so.Annotations))
+		})
+
+		It("deploys ScaledObject and creates HPA with scale down select policy disabled when pause scale-in annotation set", func() {
+			deploymentName := "disable-scale-in"
+			soName := "so-" + deploymentName
+
+			// Create the scaling target.
+			err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+			Expect(err).ToNot(HaveOccurred())
+
+			// Create the ScaledObject
+			so := &kedav1alpha1.ScaledObject{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      soName,
+					Namespace: "default",
+					Annotations: map[string]string{
+						kedav1alpha1.PausedScaleInAnnotation: "true",
+					}},
+				Spec: kedav1alpha1.ScaledObjectSpec{
+					ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+						Name: deploymentName,
+					},
+					Triggers: []kedav1alpha1.ScaleTriggers{
+						{
+							Type: "cron",
+							Metadata: map[string]string{
+								"timezone":        "UTC",
+								"start":           "0 * * * *",
+								"end":             "1 * * * *",
+								"desiredReplicas": "1",
+							},
+						},
+					},
+				},
+			}
+			err = k8sClient.Create(context.Background(), so)
+			Ω(err).ToNot(HaveOccurred())
+
+			Eventually(func() metav1.ConditionStatus {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Ω(err).ToNot(HaveOccurred())
+				return so.Status.Conditions.GetPausedCondition().Status
+			}, 5*time.Second).Should(Equal(metav1.ConditionTrue))
+
+			// Get and confirm the HPA
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+			Eventually(func() error {
+				return k8sClient.Get(context.Background(), types.NamespacedName{Name: "keda-hpa-" + soName, Namespace: "default"}, hpa)
+			}).ShouldNot(HaveOccurred())
+
+			Ω(*hpa.Spec.Behavior.ScaleDown.SelectPolicy).To(Equal(autoscalingv2.DisabledPolicySelect))
+		})
+
+		It("sets scale down select policy to disable when annotation added to existing object", func() {
+			deploymentName := "disable-scale-in-old-so"
+			soName := "so-" + deploymentName
+
+			// Create the scaling target.
+			err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+			Expect(err).ToNot(HaveOccurred())
+
+			minReplicaCount := int32(1)
+			maxReplicaCount := int32(10)
+
+			// Create the ScaledObject with 1 trigger.
+			so := &kedav1alpha1.ScaledObject{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        soName,
+					Namespace:   "default",
+					Annotations: make(map[string]string),
+				},
+				Spec: kedav1alpha1.ScaledObjectSpec{
+					ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+						Name: deploymentName,
+					},
+					Triggers: []kedav1alpha1.ScaleTriggers{
+						{
+							Type: "cron",
+							Metadata: map[string]string{
+								"timezone":        "UTC",
+								"start":           "0 * * * *",
+								"end":             "1 * * * *",
+								"desiredReplicas": "2",
+							},
+						},
+					},
+					MinReplicaCount: &minReplicaCount,
+					MaxReplicaCount: &maxReplicaCount,
+				},
+			}
+			err = k8sClient.Create(context.Background(), so)
+			Expect(err).ToNot(HaveOccurred())
+
+			testLogger.Info("Created scaled object")
+
+			// Get and confirm the HPA.
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+			Eventually(func() error {
+				return k8sClient.Get(context.Background(), types.NamespacedName{Name: "keda-hpa-" + soName, Namespace: "default"}, hpa)
+			}).ShouldNot(HaveOccurred())
+			Expect(hpa.Spec.Behavior).To(Equal((*autoscalingv2.HorizontalPodAutoscalerBehavior)(nil)))
+
+			Eventually(func() metav1.ConditionStatus {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Ω(err).ToNot(HaveOccurred())
+				return so.Status.Conditions.GetPausedCondition().Status
+			}, 2*time.Minute).WithPolling(5 * time.Second).Should(Or(Equal(metav1.ConditionFalse), Equal(metav1.ConditionUnknown)))
+
+			// Set the annotation
+			Eventually(func() error {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Expect(err).ToNot(HaveOccurred())
+
+				if so.Annotations == nil {
+					so.Annotations = make(map[string]string)
+				}
+				so.Annotations[kedav1alpha1.PausedScaleInAnnotation] = "true"
+
+				return k8sClient.Update(context.Background(), so)
+			}).ShouldNot(HaveOccurred())
+
+			Eventually(func() metav1.ConditionStatus {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Ω(err).ToNot(HaveOccurred())
+				return so.Status.Conditions.GetPausedCondition().Status
+			}, 2*time.Minute).WithPolling(5 * time.Second).Should(Equal(metav1.ConditionTrue))
+
+			Eventually(func() autoscalingv2.ScalingPolicySelect {
+				err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "keda-hpa-" + soName, Namespace: "default"}, hpa)
+				Expect(err).ToNot(HaveOccurred())
+				if hpa.Spec.Behavior != nil && hpa.Spec.Behavior.ScaleDown != nil && hpa.Spec.Behavior.ScaleDown.SelectPolicy != nil {
+					return *hpa.Spec.Behavior.ScaleDown.SelectPolicy
+				} else {
+					return ""
+				}
+			}).WithTimeout(1 * time.Minute).WithPolling(10 * time.Second).Should(Equal(autoscalingv2.DisabledPolicySelect))
+		})
+
+		It("sets scale down select policy to original policy when annotation removed", func() {
+			deploymentName := "remove-scale-in-disabled-annotation"
+			soName := "so-" + deploymentName
+
+			// Create the scaling target.
+			err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+			Expect(err).ToNot(HaveOccurred())
+
+			// Create the ScaledObject with 1 trigger.
+			minPolicy := autoscalingv2.MinChangePolicySelect
+			minReplicaCount := int32(1)
+			maxReplicaCount := int32(10)
+			so := &kedav1alpha1.ScaledObject{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      soName,
+					Namespace: "default",
+					Annotations: map[string]string{
+						kedav1alpha1.PausedScaleInAnnotation: "true",
+					},
+				},
+
+				Spec: kedav1alpha1.ScaledObjectSpec{
+					ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+						Name: deploymentName,
+					},
+					MinReplicaCount: &minReplicaCount,
+					MaxReplicaCount: &maxReplicaCount,
+					Triggers: []kedav1alpha1.ScaleTriggers{
+						{
+							Type: "cron",
+							Metadata: map[string]string{
+								"timezone":        "UTC",
+								"start":           "0 * * * *",
+								"end":             "1 * * * *",
+								"desiredReplicas": "2",
+							},
+						},
+					},
+					Advanced: &kedav1alpha1.AdvancedConfig{
+						HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{
+							Behavior: &autoscalingv2.HorizontalPodAutoscalerBehavior{
+								ScaleDown: &autoscalingv2.HPAScalingRules{
+									SelectPolicy: &minPolicy,
+								},
+							},
+						},
+					},
+				},
+			}
+			err = k8sClient.Create(context.Background(), so)
+			Expect(err).ToNot(HaveOccurred())
+			testLogger.Info("Created scaled object")
+
+			// Get and confirm the HPA.
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+			Eventually(func() error {
+				return k8sClient.Get(context.Background(), types.NamespacedName{Name: "keda-hpa-" + soName, Namespace: "default"}, hpa)
+			}).ShouldNot(HaveOccurred())
+			Expect(*hpa.Spec.Behavior.ScaleDown.SelectPolicy).To(Equal(autoscalingv2.DisabledPolicySelect))
+
+			Eventually(func() metav1.ConditionStatus {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Ω(err).ToNot(HaveOccurred())
+				return so.Status.Conditions.GetPausedCondition().Status
+			}, 2*time.Minute).WithPolling(5 * time.Second).Should(Equal(metav1.ConditionTrue))
+
+			// Remove the annotation.
+			Eventually(func() error {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Expect(err).ToNot(HaveOccurred())
+				delete(so.ObjectMeta.Annotations, kedav1alpha1.PausedScaleInAnnotation)
+				return k8sClient.Update(context.Background(), so)
+			}).ShouldNot(HaveOccurred())
+
+			Eventually(func() metav1.ConditionStatus {
+				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+				Ω(err).ToNot(HaveOccurred())
+				return so.Status.Conditions.GetPausedCondition().Status
+			}, 2*time.Minute).WithPolling(5 * time.Second).Should(Or(Equal(metav1.ConditionFalse), Equal(metav1.ConditionUnknown)))
+
+			Eventually(func() autoscalingv2.ScalingPolicySelect {
+				err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "keda-hpa-" + soName, Namespace: "default"}, hpa)
+				Expect(err).ToNot(HaveOccurred())
+				if hpa.Spec.Behavior != nil && hpa.Spec.Behavior.ScaleDown != nil && hpa.Spec.Behavior.ScaleDown.SelectPolicy != nil {
+					return *hpa.Spec.Behavior.ScaleDown.SelectPolicy
+				} else {
+					return ""
+				}
+			}).WithTimeout(1 * time.Minute).WithPolling(10 * time.Second).Should(Equal(autoscalingv2.MinChangePolicySelect))
 		})
 
 		It("doesn't allow MinReplicaCount > MaxReplicaCount", func() {
@@ -912,7 +1186,7 @@ var _ = Describe("ScaledObjectController", func() {
 			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
 			Expect(err).ToNot(HaveOccurred())
 			annotations := make(map[string]string)
-			annotations[kedacontrollerutil.PausedReplicasAnnotation] = "1"
+			annotations[kedav1alpha1.PausedReplicasAnnotation] = "1"
 			so.SetAnnotations(annotations)
 			pollingInterval := int32(6)
 			so.Spec.PollingInterval = &pollingInterval
@@ -924,8 +1198,7 @@ var _ = Describe("ScaledObjectController", func() {
 		Eventually(func() bool {
 			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
 			Expect(err).ToNot(HaveOccurred())
-			_, paused := so.GetAnnotations()[kedacontrollerutil.PausedReplicasAnnotation]
-			return paused
+			return so.HasPausedAnnotation()
 		}).WithTimeout(1 * time.Minute).WithPolling(2 * time.Second).Should(BeTrue())
 
 		Eventually(func() metav1.ConditionStatus {
@@ -935,6 +1208,124 @@ var _ = Describe("ScaledObjectController", func() {
 			}
 			return so.Status.Conditions.GetPausedCondition().Status
 		}).WithTimeout(2 * time.Minute).WithPolling(10 * time.Second).Should(Equal(metav1.ConditionTrue))
+	})
+	It("scaledObject paused status switches to false when annotation is set to false", func() {
+		// Create the scaling target.
+		deploymentName := "toggled-to-paused-annotation-false-name"
+		soName := "so-" + deploymentName
+		err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the ScaledObject without specifying name.
+		so := &kedav1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      soName,
+				Namespace: "default",
+			},
+			Spec: kedav1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+					Name: deploymentName,
+				},
+				Advanced: &kedav1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+				},
+				Triggers: []kedav1alpha1.ScaleTriggers{
+					{
+						Type: "cron",
+						Metadata: map[string]string{
+							"timezone":        "UTC",
+							"start":           "0 * * * *",
+							"end":             "1 * * * *",
+							"desiredReplicas": "1",
+						},
+					},
+				},
+			},
+		}
+		pollingInterval := int32(5)
+		so.Spec.PollingInterval = &pollingInterval
+		err = k8sClient.Create(context.Background(), so)
+		Expect(err).ToNot(HaveOccurred())
+
+		// And validate that hpa is created.
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		Eventually(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+		}).ShouldNot(HaveOccurred())
+
+		// wait so's ready condition Ready
+		Eventually(func() metav1.ConditionStatus {
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			if err != nil {
+				return metav1.ConditionUnknown
+			}
+			return so.Status.Conditions.GetReadyCondition().Status
+		}).Should(Equal(metav1.ConditionTrue))
+
+		Eventually(func() metav1.ConditionStatus {
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			if err != nil {
+				return metav1.ConditionTrue
+			}
+			return so.Status.Conditions.GetPausedCondition().Status
+		}, 5*time.Second).Should(Or(Equal(metav1.ConditionFalse), Equal(metav1.ConditionUnknown)))
+
+		// set annotation to true at first
+		Eventually(func() error {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			Expect(err).ToNot(HaveOccurred())
+			annotations := make(map[string]string)
+			annotations[kedav1alpha1.PausedAnnotation] = "true"
+			so.SetAnnotations(annotations)
+			pollingInterval := int32(6)
+			so.Spec.PollingInterval = &pollingInterval
+			return k8sClient.Update(context.Background(), so)
+		}).WithTimeout(1 * time.Minute).WithPolling(10 * time.Second).ShouldNot(HaveOccurred())
+		testLogger.Info("annotation is set")
+
+		// validate annotation is set correctly
+		Eventually(func() bool {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			Expect(err).ToNot(HaveOccurred())
+			return so.HasPausedAnnotation()
+		}).WithTimeout(1 * time.Minute).WithPolling(2 * time.Second).Should(BeTrue())
+
+		Eventually(func() metav1.ConditionStatus {
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			if err != nil {
+				return metav1.ConditionUnknown
+			}
+			return so.Status.Conditions.GetPausedCondition().Status
+		}).WithTimeout(2 * time.Minute).WithPolling(10 * time.Second).Should(Equal(metav1.ConditionTrue))
+
+		// set annotation to false and confirm that ScaledObject is no longer paused
+		Eventually(func() error {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			Expect(err).ToNot(HaveOccurred())
+			annotations := make(map[string]string)
+			annotations[kedav1alpha1.PausedAnnotation] = "false"
+			so.SetAnnotations(annotations)
+			pollingInterval := int32(6)
+			so.Spec.PollingInterval = &pollingInterval
+			return k8sClient.Update(context.Background(), so)
+		}).WithTimeout(1 * time.Minute).WithPolling(10 * time.Second).ShouldNot(HaveOccurred())
+		testLogger.Info("annotation is set")
+
+		// validate annotation is set correctly
+		Eventually(func() bool {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			Expect(err).ToNot(HaveOccurred())
+			return so.HasPausedAnnotation()
+		}).WithTimeout(1 * time.Minute).WithPolling(2 * time.Second).Should(BeTrue())
+
+		// ensure object is no longer paused
+		Eventually(func() metav1.ConditionStatus {
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			if err != nil {
+				return metav1.ConditionUnknown
+			}
+			return so.Status.Conditions.GetPausedCondition().Status
+		}).WithTimeout(2 * time.Minute).WithPolling(10 * time.Second).Should(Equal(metav1.ConditionFalse))
 	})
 
 	// Fix issue 4253
@@ -952,7 +1343,7 @@ var _ = Describe("ScaledObjectController", func() {
 				Name:      soName,
 				Namespace: "default",
 				Annotations: map[string]string{
-					kedacontrollerutil.PausedReplicasAnnotation: pausedReplicasCountForAnnotation,
+					kedav1alpha1.PausedReplicasAnnotation: pausedReplicasCountForAnnotation,
 				},
 			},
 			Spec: kedav1alpha1.ScaledObjectSpec{
@@ -992,7 +1383,8 @@ var _ = Describe("ScaledObjectController", func() {
 		// validate annotation is set correctly
 		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
 		Expect(err).ToNot(HaveOccurred())
-		pausedReplicasCount, paused := so.GetAnnotations()[kedacontrollerutil.PausedReplicasAnnotation]
+		paused := so.HasPausedAnnotation()
+		pausedReplicasCount := so.GetAnnotations()[kedav1alpha1.PausedReplicasAnnotation]
 		Expect(paused).To(Equal(true))
 		Expect(pausedReplicasCount).To(Equal(pausedReplicasCountForAnnotation))
 
@@ -1029,6 +1421,309 @@ var _ = Describe("ScaledObjectController", func() {
 			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
 		}).Should(HaveOccurred())
 	})
+
+	// Fix issue 5281
+	It("reconciles scaledobject when hpa spec is changed", func() {
+		var (
+			deploymentName        = "hpa-spec-change"
+			soName                = "so-" + deploymentName
+			min             int32 = 1
+			max             int32 = 5
+			newMin          int32 = 2
+			newMax          int32 = 6
+			pollingInterVal int32 = 1
+		)
+
+		err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the ScaledObject without specifying name.
+		so := &kedav1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      soName,
+				Namespace: "default",
+			},
+			Spec: kedav1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+					Name: deploymentName,
+				},
+				MinReplicaCount: &min,
+				MaxReplicaCount: &max,
+				PollingInterval: &pollingInterVal,
+				Advanced: &kedav1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+				},
+				Triggers: []kedav1alpha1.ScaleTriggers{
+					{
+						Type: "cron",
+						Metadata: map[string]string{
+							"timezone":        "UTC",
+							"start":           "0 * * * *",
+							"end":             "1 * * * *",
+							"desiredReplicas": "1",
+						},
+					},
+				},
+			},
+		}
+		err = k8sClient.Create(context.Background(), so)
+		Expect(err).ToNot(HaveOccurred())
+
+		// And validate that hpa is created.
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		Eventually(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+		}).ShouldNot(HaveOccurred())
+
+		// Change hpa spec and update
+		hpa.Spec.MinReplicas = &newMin
+		hpa.Spec.MaxReplicas = newMax
+		err = k8sClient.Update(context.Background(), hpa)
+		Expect(err).ToNot(HaveOccurred())
+
+		// scaledobject should be reconciled and hpa spec should match with scaledobject spec
+		Eventually(func() bool {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+			if err != nil {
+				return false
+			}
+			return *hpa.Spec.MinReplicas == min && hpa.Spec.MaxReplicas == max
+		}).Should(BeTrue())
+	})
+
+	It("reconciles scaledobject when hpa label is changed", func() {
+		var (
+			deploymentName = "hpa-label-change"
+			soName         = "so-" + deploymentName
+		)
+
+		err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the ScaledObject without specifying name.
+		so := &kedav1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      soName,
+				Namespace: "default",
+			},
+			Spec: kedav1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+					Name: deploymentName,
+				},
+				Advanced: &kedav1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+				},
+				Triggers: []kedav1alpha1.ScaleTriggers{
+					{
+						Type: "cron",
+						Metadata: map[string]string{
+							"timezone":        "UTC",
+							"start":           "0 * * * *",
+							"end":             "1 * * * *",
+							"desiredReplicas": "1",
+						},
+					},
+				},
+			},
+		}
+		err = k8sClient.Create(context.Background(), so)
+		Expect(err).ToNot(HaveOccurred())
+
+		// And validate that hpa is created.
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		Eventually(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+		}).ShouldNot(HaveOccurred())
+
+		// Add a new label to the hpa and update
+		hpa.ObjectMeta.Labels = map[string]string{"new-label": "new-label-value"}
+		err = k8sClient.Update(context.Background(), hpa)
+		Expect(err).ToNot(HaveOccurred())
+
+		// scaledobject should be reconciled and hpa should not contain this manually added label
+		Eventually(func() bool {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+			if err != nil {
+				return false
+			}
+			// Check if the label is not present
+			if _, ok := hpa.ObjectMeta.Labels["new-label"]; !ok {
+				return true
+			}
+			return false
+		}).Should(BeTrue())
+	})
+
+	It("reconciles scaledobject when hpa annotation is changed", func() {
+		var (
+			deploymentName = "hpa-annotation-change"
+			soName         = "so-" + deploymentName
+		)
+
+		err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the ScaledObject without specifying name.
+		so := &kedav1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      soName,
+				Namespace: "default",
+			},
+			Spec: kedav1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+					Name: deploymentName,
+				},
+				Advanced: &kedav1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+				},
+				Triggers: []kedav1alpha1.ScaleTriggers{
+					{
+						Type: "cron",
+						Metadata: map[string]string{
+							"timezone":        "UTC",
+							"start":           "0 * * * *",
+							"end":             "1 * * * *",
+							"desiredReplicas": "1",
+						},
+					},
+				},
+			},
+		}
+		err = k8sClient.Create(context.Background(), so)
+		Expect(err).ToNot(HaveOccurred())
+
+		// And validate that hpa is created.
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		Eventually(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+		}).ShouldNot(HaveOccurred())
+
+		// Add a new annotation to the hpa and update
+		hpa.ObjectMeta.Annotations = map[string]string{"new-annotation": "new-annotation-value"}
+		err = k8sClient.Update(context.Background(), hpa)
+		Expect(err).ToNot(HaveOccurred())
+
+		// scaledobject should be reconciled and hpa should not contain this manually added annotation
+		Eventually(func() bool {
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+			if err != nil {
+				return false
+			}
+			// Check if the annotation is not present
+			if _, ok := hpa.ObjectMeta.Annotations["new-annotation"]; !ok {
+				return true
+			}
+			return false
+		}, 5*time.Second).Should(BeTrue())
+	})
+
+	// Fix issue 5281
+	It("reconciles scaledobject and creates hpa when child hpa is deleted", func() {
+		var (
+			deploymentName        = "hpa-deleted"
+			soName                = "so-" + deploymentName
+			min             int32 = 1
+			max             int32 = 5
+			pollingInterVal int32 = 1
+		)
+
+		err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the ScaledObject without specifying name.
+		so := &kedav1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      soName,
+				Namespace: "default",
+			},
+			Spec: kedav1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+					Name: deploymentName,
+				},
+				MinReplicaCount: &min,
+				MaxReplicaCount: &max,
+				PollingInterval: &pollingInterVal,
+				Advanced: &kedav1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+				},
+				Triggers: []kedav1alpha1.ScaleTriggers{
+					{
+						Type: "cron",
+						Metadata: map[string]string{
+							"timezone":        "UTC",
+							"start":           "0 * * * *",
+							"end":             "1 * * * *",
+							"desiredReplicas": "1",
+						},
+					},
+				},
+			},
+		}
+		err = k8sClient.Create(context.Background(), so)
+		Expect(err).ToNot(HaveOccurred())
+
+		// And validate that hpa is created.
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		Eventually(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+		}).ShouldNot(HaveOccurred())
+
+		// Delete the child hpa
+		err = k8sClient.Delete(context.Background(), hpa)
+		Expect(err).ToNot(HaveOccurred())
+
+		// scaledobject should be reconciled and again the corresponding hpa should be created
+		Eventually(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("keda-hpa-%s", soName), Namespace: "default"}, hpa)
+
+		}).Should(BeNil())
+	})
+
+	// Fix issue 5520
+	It("create scaledobject with empty triggers should be blocked", func() {
+		var (
+			deploymentName        = "block-deleted"
+			soName                = "so-" + deploymentName
+			min             int32 = 1
+			max             int32 = 5
+			pollingInterVal int32 = 1
+		)
+
+		err := k8sClient.Create(context.Background(), generateDeployment(deploymentName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the ScaledObject without specifying name.
+		so := &kedav1alpha1.ScaledObject{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      soName,
+				Namespace: "default",
+			},
+			Spec: kedav1alpha1.ScaledObjectSpec{
+				ScaleTargetRef: &kedav1alpha1.ScaleTarget{
+					Name: deploymentName,
+				},
+				MinReplicaCount: &min,
+				MaxReplicaCount: &max,
+				PollingInterval: &pollingInterVal,
+				Advanced: &kedav1alpha1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1alpha1.HorizontalPodAutoscalerConfig{},
+				},
+				Triggers: []kedav1alpha1.ScaleTriggers{},
+			},
+		}
+		err = k8sClient.Create(context.Background(), so)
+		Expect(err).ToNot(HaveOccurred())
+
+		// wait to check so's ready condition Not Ready
+		Eventually(func() metav1.ConditionStatus {
+			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: soName, Namespace: "default"}, so)
+			if err != nil {
+				return metav1.ConditionUnknown
+			}
+			return so.Status.Conditions.GetReadyCondition().Status
+		}).Should(Equal(metav1.ConditionFalse))
+	})
+
 })
 
 func generateDeployment(name string) *appsv1.Deployment {

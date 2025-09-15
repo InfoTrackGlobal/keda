@@ -22,57 +22,80 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-const customCAPath = "/custom/ca"
+const defaultCustomCAPath = "/custom/ca"
 
 var logger = logf.Log.WithName("certificates")
 
-var rootCAs *x509.CertPool
+var (
+	rootCAs       *x509.CertPool
+	rootCAsLock   sync.Mutex
+	customCAPaths = []string{defaultCustomCAPath}
+)
+
+// SetCACertDirs sets location(s) containing CA certificates which should be trusted for
+// all future calls to CreateTLSClientConfig
+func SetCACertDirs(caCertDirs []string) {
+	customCAPaths = caCertDirs
+	rootCAs = nil // force a reload on the next call to getRootCAs()
+}
 
 func getRootCAs() *x509.CertPool {
+	rootCAsLock.Lock()
+	defer rootCAsLock.Unlock()
+
 	if rootCAs != nil {
-		return rootCAs.Clone()
+		return rootCAs
 	}
 
-	rootCAs, _ = x509.SystemCertPool()
+	var err error
+	rootCAs, err = x509.SystemCertPool()
 	if rootCAs == nil {
 		rootCAs = x509.NewCertPool()
-	}
-
-	if _, err := os.Stat(customCAPath); errors.Is(err, fs.ErrNotExist) {
-		logger.V(1).Info(fmt.Sprintf("the path %s doesn't exist, skipping custom CA registrations", customCAPath))
-		return rootCAs.Clone()
-	}
-
-	files, err := os.ReadDir(customCAPath)
-	if err != nil {
-		logger.Error(err, fmt.Sprintf("unable to read %s", customCAPath))
-		return rootCAs.Clone()
-	}
-
-	for _, file := range files {
-		if file.IsDir() || strings.HasPrefix(file.Name(), "..") {
-			logger.V(1).Info(fmt.Sprintf("%s isn't a valid certificate", file.Name()))
-			continue
-		}
-
-		certs, err := os.ReadFile(path.Join(customCAPath, file.Name()))
 		if err != nil {
-			logger.Error(err, fmt.Sprintf("error reading %q", file.Name()))
-			continue
+			logger.Error(err, "failed to load system cert pool, using new cert pool instead")
+		} else {
+			logger.V(1).Info("system cert pool not available, using new cert pool instead")
 		}
-
-		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
-			logger.Error(fmt.Errorf("no certs appended"), fmt.Sprintf("the certificate %s hasn't been added to the pool", file.Name()))
-			continue
-		}
-		logger.V(1).Info(fmt.Sprintf("the certificate %s has been added to the pool", file.Name()))
 	}
+	for _, customCAPath := range customCAPaths {
+		if _, err := os.Stat(customCAPath); errors.Is(err, fs.ErrNotExist) {
+			logger.V(1).Info(fmt.Sprintf("the path %s doesn't exist, skipping custom CA registrations", customCAPath))
+			continue
+		}
 
-	return rootCAs.Clone()
+		files, err := os.ReadDir(customCAPath)
+		if err != nil {
+			logger.Error(err, fmt.Sprintf("unable to read %s", customCAPath))
+			continue
+		}
+
+		for _, file := range files {
+			filename := file.Name()
+			if file.IsDir() || strings.HasPrefix(filename, "..") {
+				logger.V(1).Info(fmt.Sprintf("%s isn't a valid certificate", filename))
+				continue // Skip directories and special files
+			}
+
+			filePath := filepath.Join(customCAPath, filename)
+			certs, err := os.ReadFile(filePath)
+			if err != nil {
+				logger.Error(err, fmt.Sprintf("error reading %q", filename))
+				continue
+			}
+
+			if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+				logger.Error(fmt.Errorf("no certs appended"), "filename", filename)
+				continue
+			}
+			logger.V(1).Info(fmt.Sprintf("the certificate %s has been added to the pool", filename))
+		}
+	}
+	return rootCAs
 }

@@ -12,6 +12,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [1.7.0] - 2024-09-23
+
+This release is the first after the donation of gocql to the Apache Software Foundation (ASF)
+
+### Changed
+- Update DRIVER_NAME parameter in STARTUP messages to a different value intended to clearly identify this
+  driver as an ASF driver.  This should clearly distinguish this release (and future gocql-cassandra-driver
+  releases) from prior versions. (#1824)
+- Supported Go versions updated to 1.23 and 1.22 to conform to gocql's sunset model. (#1825)
+
+## [1.6.0] - 2023-08-28
+
+### Added
+- Added the InstaclustrPasswordAuthenticator to the list of default approved authenticators. (#1711)
+- Added the `com.scylladb.auth.SaslauthdAuthenticator` and `com.scylladb.auth.TransitionalAuthenticator`
+  to the list of default approved authenticators. (#1712)
+- Added transferring Keyspace and Table names to the Query from the prepared response and updating
+  information about that every time this information is received. (#1714)
+
+### Changed
+- Tracer created with NewTraceWriter now includes the thread information from trace events in the output. (#1716)
+- Increased default timeouts so that they are higher than Cassandra default timeouts.
+  This should help prevent issues where a default configuration overloads a server using default timeouts
+  during retries. (#1701, #1719)
+
+## [1.5.2] - 2023-06-12
+
+Same as 1.5.0. GitHub does not like gpg signed text in the tag message (even with prefixed armor),
+so pushing a new tag.
+
+## [1.5.1] - 2023-06-12
+
+Same as 1.5.0. GitHub does not like gpg signed text in the tag message,
+so pushing a new tag.
+
 ## [1.5.0] - 2023-06-12
 
 ### Added

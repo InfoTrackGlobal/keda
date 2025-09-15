@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"k8s.io/metrics/pkg/apis/external_metrics"
@@ -36,8 +37,8 @@ type GrpcClient struct {
 	connection *grpc.ClientConn
 }
 
-func NewGrpcClient(url, certDir string) (*GrpcClient, error) {
-	retryPolicy := `{
+func NewGrpcClient(ctx context.Context, url, certDir, authority string, clientMetrics *grpcprom.ClientMetrics) (*GrpcClient, error) {
+	defaultConfig := `{
 		"methodConfig": [{
 		  "timeout": "3s",
 		  "waitForReady": true,
@@ -49,15 +50,29 @@ func NewGrpcClient(url, certDir string) (*GrpcClient, error) {
 		  }
 		}]}`
 
-	creds, err := utils.LoadGrpcTLSCredentials(certDir, false)
+	creds, err := utils.LoadGrpcTLSCredentials(ctx, certDir, false)
 	if err != nil {
 		return nil, err
 	}
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
-		grpc.WithDefaultServiceConfig(retryPolicy),
+		grpc.WithDefaultServiceConfig(defaultConfig),
 	}
-	conn, err := grpc.Dial(url, opts...)
+
+	opts = append(
+		opts,
+		grpc.WithChainUnaryInterceptor(clientMetrics.UnaryClientInterceptor()),
+		grpc.WithChainStreamInterceptor(clientMetrics.StreamClientInterceptor()),
+	)
+
+	if authority != "" {
+		// If an Authority header override is specified, add it to the client so it is set on every request.
+		// This is useful when the address used to dial the GRPC server does not match any hosts provided in the TLS certificate's
+		// SAN
+		opts = append(opts, grpc.WithAuthority(authority))
+	}
+
+	conn, err := grpc.NewClient(url, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +96,7 @@ func (c *GrpcClient) GetMetrics(ctx context.Context, scaledObjectName, scaledObj
 }
 
 // WaitForConnectionReady waits for gRPC connection to be ready
-// returns true if the connection was successful, false if we hit a timeut from context
+// returns true if the connection was successful, false if we hit a timeout from context
 func (c *GrpcClient) WaitForConnectionReady(ctx context.Context, logger logr.Logger) bool {
 	currentState := c.connection.GetState()
 	if currentState != connectivity.Ready {

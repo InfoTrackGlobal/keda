@@ -34,7 +34,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/eventemitter"
 	"github.com/kedacore/keda/v2/pkg/k8s"
+	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
 	"github.com/kedacore/keda/v2/pkg/scaling"
 	//+kubebuilder:scaffold:imports
 )
@@ -90,12 +92,22 @@ var _ = BeforeSuite(func() {
 	scaleClient, _, err := k8s.InitScaleClient(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
+	authClientSet := &authentication.AuthClientSet{}
+
 	err = (&ScaledObjectReconciler{
 		Client:       k8sManager.GetClient(),
 		Scheme:       k8sManager.GetScheme(),
-		Recorder:     k8sManager.GetEventRecorderFor("keda-operator"),
-		ScaleHandler: scaling.NewScaleHandler(k8sManager.GetClient(), scaleClient, k8sManager.GetScheme(), time.Duration(10), k8sManager.GetEventRecorderFor("keda-operator"), nil),
+		ScaleHandler: scaling.NewScaleHandler(k8sManager.GetClient(), scaleClient, k8sManager.GetScheme(), time.Duration(10), k8sManager.GetEventRecorderFor("keda-operator"), authClientSet),
 		ScaleClient:  scaleClient,
+		EventEmitter: eventemitter.NewEventEmitter(k8sManager.GetClient(), k8sManager.GetEventRecorderFor("keda-operator"), "kubernetes-default", nil),
+	}).SetupWithManager(k8sManager, controller.Options{})
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&ScaledJobReconciler{
+		Client:        k8sManager.GetClient(),
+		Scheme:        k8sManager.GetScheme(),
+		EventEmitter:  eventemitter.NewEventEmitter(k8sManager.GetClient(), k8sManager.GetEventRecorderFor("keda-operator"), "kubernetes-default", nil),
+		AuthClientSet: authClientSet,
 	}).SetupWithManager(k8sManager, controller.Options{})
 	Expect(err).ToNot(HaveOccurred())
 

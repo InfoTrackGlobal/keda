@@ -15,38 +15,44 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 const (
-	defaultTargetWorkflowQueueLength = 1
-	defaultGithubAPIURL              = "https://api.github.com"
-	ORG                              = "org"
-	ENT                              = "ent"
-	REPO                             = "repo"
+	ORG                  = "org"
+	ENT                  = "ent"
+	REPO                 = "repo"
+	githubDefaultPerPage = 30
 )
 
 var reservedLabels = []string{"self-hosted", "linux", "x64"}
 
 type githubRunnerScaler struct {
-	metricType v2.MetricTargetType
-	metadata   *githubRunnerMetadata
-	httpClient *http.Client
-	logger     logr.Logger
+	metricType    v2.MetricTargetType
+	metadata      *githubRunnerMetadata
+	httpClient    *http.Client
+	logger        logr.Logger
+	etags         map[string]string
+	previousRepos []string
+	previousWfrs  map[string]map[string]*WorkflowRuns
+	previousJobs  map[string][]Job
 }
 
 type githubRunnerMetadata struct {
-	githubAPIURL              string
-	owner                     string
-	runnerScope               string
-	personalAccessToken       *string
-	repos                     []string
-	labels                    []string
-	targetWorkflowQueueLength int64
-	scalerIndex               int
-	applicationID             *int64
-	installationID            *int64
-	applicationKey            *string
+	GithubAPIURL              string   `keda:"name=githubApiURL, order=triggerMetadata;resolvedEnv, default=https://api.github.com"`
+	Owner                     string   `keda:"name=owner, order=triggerMetadata;resolvedEnv"`
+	RunnerScope               string   `keda:"name=runnerScope, order=triggerMetadata;resolvedEnv, enum=org;ent;repo"`
+	PersonalAccessToken       string   `keda:"name=personalAccessToken, order=authParams, optional"`
+	Repos                     []string `keda:"name=repos, order=triggerMetadata;resolvedEnv, optional"`
+	Labels                    []string `keda:"name=labels, order=triggerMetadata;resolvedEnv, optional"`
+	NoDefaultLabels           bool     `keda:"name=noDefaultLabels, order=triggerMetadata;resolvedEnv, default=false"`
+	EnableEtags               bool     `keda:"name=enableEtags, order=triggerMetadata;resolvedEnv, default=false"`
+	TargetWorkflowQueueLength int64    `keda:"name=targetWorkflowQueueLength, order=triggerMetadata;resolvedEnv, default=1"`
+	TriggerIndex              int
+	ApplicationID             int64  `keda:"name=applicationID, order=triggerMetadata;resolvedEnv, optional"`
+	InstallationID            int64  `keda:"name=installationID, order=triggerMetadata;resolvedEnv, optional"`
+	ApplicationKey            string `keda:"name=appKey, order=authParams, optional"`
 }
 
 type WorkflowRuns struct {
@@ -325,7 +331,7 @@ type Job struct {
 }
 
 // NewGitHubRunnerScaler creates a new GitHub Runner Scaler
-func NewGitHubRunnerScaler(config *ScalerConfig) (Scaler, error) {
+func NewGitHubRunnerScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	httpClient := kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false)
 
 	metricType, err := GetMetricTargetType(config)
@@ -338,167 +344,128 @@ func NewGitHubRunnerScaler(config *ScalerConfig) (Scaler, error) {
 		return nil, fmt.Errorf("error parsing GitHub Runner metadata: %w", err)
 	}
 
-	if meta.applicationID != nil && meta.installationID != nil && meta.applicationKey != nil {
+	if meta.ApplicationID != 0 && meta.InstallationID != 0 && meta.ApplicationKey != "" {
 		httpTrans := kedautil.CreateHTTPTransport(false)
-		hc, err := gha.New(httpTrans, *meta.applicationID, *meta.installationID, []byte(*meta.applicationKey))
+		hc, err := gha.New(httpTrans, meta.ApplicationID, meta.InstallationID, []byte(meta.ApplicationKey))
 		if err != nil {
-			return nil, fmt.Errorf("error creating GitHub App client: %w, \n appID: %d, instID: %d", err, meta.applicationID, meta.installationID)
+			return nil, fmt.Errorf("error creating GitHub App client: %w, \n appID: %d, instID: %d", err, meta.ApplicationID, meta.InstallationID)
 		}
+		hc.BaseURL = meta.GithubAPIURL
 		httpClient = &http.Client{Transport: hc}
 	}
 
+	etags := make(map[string]string)
+	previousRepos := []string{}
+	previousJobs := make(map[string][]Job)
+	previousWfrs := make(map[string]map[string]*WorkflowRuns)
+
 	return &githubRunnerScaler{
-		metricType: metricType,
-		metadata:   meta,
-		httpClient: httpClient,
-		logger:     InitializeLogger(config, "github_runner_scaler"),
+		metricType:    metricType,
+		metadata:      meta,
+		httpClient:    httpClient,
+		logger:        InitializeLogger(config, "github_runner_scaler"),
+		etags:         etags,
+		previousRepos: previousRepos,
+		previousJobs:  previousJobs,
+		previousWfrs:  previousWfrs,
 	}, nil
 }
 
-// getValueFromMetaOrEnv returns the value of the given key from the metadata or the environment variables
-func getValueFromMetaOrEnv(key string, metadata map[string]string, env map[string]string) (string, error) {
-	if val, ok := metadata[key]; ok && val != "" {
-		return val, nil
-	} else if val, ok := metadata[key+"FromEnv"]; ok && val != "" {
-		return env[val], nil
+func (meta *githubRunnerMetadata) Validate() error {
+	if meta.ApplicationKey == "" && meta.PersonalAccessToken == "" {
+		return fmt.Errorf("no personalAccessToken or appKey given")
 	}
-	return "", fmt.Errorf("no %s given", key)
+	if meta.ApplicationID != 0 || meta.InstallationID != 0 || meta.ApplicationKey != "" {
+		if err := validateGitHubApp(meta); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// getInt64ValueFromMetaOrEnv returns the value of the given key from the metadata or the environment variables
-func getInt64ValueFromMetaOrEnv(key string, config *ScalerConfig) (int64, error) {
-	sInt, err := getValueFromMetaOrEnv(key, config.TriggerMetadata, config.ResolvedEnv)
-	if err != nil {
-		return -1, fmt.Errorf("error parsing %s: %w", key, err)
-	}
-
-	goodInt, err := strconv.ParseInt(sInt, 10, 64)
-	if err != nil {
-		return -1, fmt.Errorf("error parsing %s: %w", key, err)
-	}
-	return goodInt, nil
-}
-
-func parseGitHubRunnerMetadata(config *ScalerConfig) (*githubRunnerMetadata, error) {
+func parseGitHubRunnerMetadata(config *scalersconfig.ScalerConfig) (*githubRunnerMetadata, error) {
 	meta := &githubRunnerMetadata{}
-	meta.targetWorkflowQueueLength = defaultTargetWorkflowQueueLength
-
-	if val, err := getValueFromMetaOrEnv("runnerScope", config.TriggerMetadata, config.ResolvedEnv); err == nil && val != "" {
-		meta.runnerScope = val
-	} else {
-		return nil, err
+	if err := config.TypedConfig(meta); err != nil {
+		return nil, fmt.Errorf("error parsing github runner metadata: %w", err)
 	}
 
-	if val, err := getValueFromMetaOrEnv("owner", config.TriggerMetadata, config.ResolvedEnv); err == nil && val != "" {
-		meta.owner = val
-	} else {
-		return nil, err
-	}
-
-	if val, err := getInt64ValueFromMetaOrEnv("targetWorkflowQueueLength", config); err == nil && val != -1 {
-		meta.targetWorkflowQueueLength = val
-	} else {
-		meta.targetWorkflowQueueLength = defaultTargetWorkflowQueueLength
-	}
-
-	if val, err := getValueFromMetaOrEnv("labels", config.TriggerMetadata, config.ResolvedEnv); err == nil && val != "" {
-		meta.labels = strings.Split(val, ",")
-	}
-
-	if val, err := getValueFromMetaOrEnv("repos", config.TriggerMetadata, config.ResolvedEnv); err == nil && val != "" {
-		meta.repos = strings.Split(val, ",")
-	}
-
-	if val, err := getValueFromMetaOrEnv("githubApiURL", config.TriggerMetadata, config.ResolvedEnv); err == nil && val != "" {
-		meta.githubAPIURL = val
-	} else {
-		meta.githubAPIURL = defaultGithubAPIURL
-	}
-
-	if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
-		// Found the pat token in a parameter from TriggerAuthentication
-		meta.personalAccessToken = &val
-	}
-
-	if appID, instID, key, err := setupGitHubApp(config); err == nil {
-		meta.applicationID = appID
-		meta.installationID = instID
-		meta.applicationKey = key
-	} else {
-		return nil, err
-	}
-
-	if meta.applicationKey == nil && meta.personalAccessToken == nil {
-		return nil, fmt.Errorf("no personalAccessToken or appKey given")
-	}
-
-	meta.scalerIndex = config.ScalerIndex
+	meta.TriggerIndex = config.TriggerIndex
 
 	return meta, nil
 }
 
-func setupGitHubApp(config *ScalerConfig) (*int64, *int64, *string, error) {
-	var appID *int64
-	var instID *int64
-	var appKey *string
-
-	if val, err := getInt64ValueFromMetaOrEnv("applicationID", config); err == nil && val != -1 {
-		appID = &val
+func validateGitHubApp(meta *githubRunnerMetadata) error {
+	if meta.ApplicationID == 0 {
+		return fmt.Errorf("no applicationID given")
 	}
-
-	if val, err := getInt64ValueFromMetaOrEnv("installationID", config); err == nil && val != -1 {
-		instID = &val
+	if meta.InstallationID == 0 {
+		return fmt.Errorf("no installationID given")
 	}
-
-	if val, ok := config.AuthParams["appKey"]; ok && val != "" {
-		appKey = &val
+	if meta.ApplicationKey == "" {
+		return fmt.Errorf("no appKey given")
 	}
-
-	if (appID != nil || instID != nil || appKey != nil) &&
-		(appID == nil || instID == nil || appKey == nil) {
-		return nil, nil, nil, fmt.Errorf("applicationID, installationID and applicationKey must be given")
-	}
-
-	return appID, instID, appKey, nil
+	return nil
 }
 
 // getRepositories returns a list of repositories for a given organization, user or enterprise
 func (s *githubRunnerScaler) getRepositories(ctx context.Context) ([]string, error) {
-	if s.metadata.repos != nil {
-		return s.metadata.repos, nil
+	if s.metadata.Repos != nil {
+		return s.metadata.Repos, nil
 	}
 
-	var url string
-	switch s.metadata.runnerScope {
-	case ORG:
-		url = fmt.Sprintf("%s/orgs/%s/repos", s.metadata.githubAPIURL, s.metadata.owner)
-	case REPO:
-		url = fmt.Sprintf("%s/users/%s/repos", s.metadata.githubAPIURL, s.metadata.owner)
-	case ENT:
-		url = fmt.Sprintf("%s/orgs/%s/repos", s.metadata.githubAPIURL, s.metadata.owner)
-	default:
-		return nil, fmt.Errorf("runnerScope %s not supported", s.metadata.runnerScope)
-	}
-	body, _, err := getGithubRequest(ctx, url, s.metadata, s.httpClient)
-	if err != nil {
-		return nil, err
-	}
-
-	var repos []Repo
-	err = json.Unmarshal(body, &repos)
-	if err != nil {
-		return nil, err
-	}
-
+	page := 1
 	var repoList []string
-	for _, repo := range repos {
-		repoList = append(repoList, repo.Name)
+
+	for {
+		var url string
+		switch s.metadata.RunnerScope {
+		case ORG, ENT:
+			url = fmt.Sprintf("%s/orgs/%s/repos?page=%s", s.metadata.GithubAPIURL, s.metadata.Owner, strconv.Itoa(page))
+		case REPO:
+			url = fmt.Sprintf("%s/users/%s/repos?page=%s", s.metadata.GithubAPIURL, s.metadata.Owner, strconv.Itoa(page))
+		default:
+			return nil, fmt.Errorf("runnerScope %s not supported", s.metadata.RunnerScope)
+		}
+
+		body, statusCode, err := s.getGithubRequest(ctx, url, s.metadata, s.httpClient)
+		if err != nil {
+			return nil, err
+		}
+		if statusCode == 304 && s.metadata.EnableEtags {
+			if s.previousRepos != nil {
+				return s.previousRepos, nil
+			}
+
+			return nil, fmt.Errorf("request for repositories returned status: %d %s but previous repositories is not set", statusCode, http.StatusText(statusCode))
+		}
+
+		var repos []Repo
+
+		err = json.Unmarshal(body, &repos)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, repo := range repos {
+			repoList = append(repoList, repo.Name)
+		}
+
+		// GitHub returned less than 30 repos per page, so consider no repos left
+		if len(repos) < githubDefaultPerPage {
+			break
+		}
+
+		page++
+	}
+
+	if s.metadata.EnableEtags {
+		s.previousRepos = repoList
 	}
 
 	return repoList, nil
 }
 
-func getGithubRequest(ctx context.Context, url string, metadata *githubRunnerMetadata, httpClient *http.Client) ([]byte, int, error) {
+func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, url string, metadata *githubRunnerMetadata, httpClient *http.Client) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return []byte{}, -1, err
@@ -507,8 +474,14 @@ func getGithubRequest(ctx context.Context, url string, metadata *githubRunnerMet
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	if metadata.applicationID == nil && metadata.personalAccessToken != nil {
-		req.Header.Set("Authorization", "Bearer "+*metadata.personalAccessToken)
+	if metadata.ApplicationID == 0 && metadata.PersonalAccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+metadata.PersonalAccessToken)
+	}
+
+	if s.metadata.EnableEtags {
+		if etag, found := s.etags[url]; found {
+			req.Header.Set("If-None-Match", etag)
+		}
 	}
 
 	r, err := httpClient.Do(req)
@@ -523,6 +496,11 @@ func getGithubRequest(ctx context.Context, url string, metadata *githubRunnerMet
 	_ = r.Body.Close()
 
 	if r.StatusCode != 200 {
+		if r.StatusCode == 304 && s.metadata.EnableEtags {
+			s.logger.V(1).Info(fmt.Sprintf("The github rest api for the url: %s returned status %d %s", url, r.StatusCode, http.StatusText(r.StatusCode)))
+			return []byte{}, r.StatusCode, nil
+		}
+
 		if r.Header.Get("X-RateLimit-Remaining") != "" {
 			githubAPIRemaining, _ := strconv.Atoi(r.Header.Get("X-RateLimit-Remaining"))
 
@@ -535,6 +513,12 @@ func getGithubRequest(ctx context.Context, url string, metadata *githubRunnerMet
 		return []byte{}, r.StatusCode, fmt.Errorf("the GitHub REST API returned error. url: %s status: %d response: %s", url, r.StatusCode, string(b))
 	}
 
+	if s.metadata.EnableEtags {
+		if etag := r.Header.Get("ETag"); etag != "" {
+			s.etags[url] = etag
+		}
+	}
+
 	return b, r.StatusCode, nil
 }
 
@@ -542,7 +526,7 @@ func stripDeadRuns(allWfrs []WorkflowRuns) []WorkflowRun {
 	var filtered []WorkflowRun
 	for _, wfrs := range allWfrs {
 		for _, wfr := range wfrs.WorkflowRuns {
-			if wfr.Status == "queued" {
+			if wfr.Status == "queued" || wfr.Status == "in_progress" {
 				filtered = append(filtered, wfr)
 			}
 		}
@@ -552,10 +536,17 @@ func stripDeadRuns(allWfrs []WorkflowRuns) []WorkflowRun {
 
 // getWorkflowRunJobs returns a list of jobs for a given workflow run
 func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRunID int64, repoName string) ([]Job, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs", s.metadata.githubAPIURL, s.metadata.owner, repoName, workflowRunID)
-	body, _, err := getGithubRequest(ctx, url, s.metadata, s.httpClient)
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100", s.metadata.GithubAPIURL, s.metadata.Owner, repoName, workflowRunID)
+	body, statusCode, err := s.getGithubRequest(ctx, url, s.metadata, s.httpClient)
 	if err != nil {
 		return nil, err
+	}
+	if statusCode == 304 && s.metadata.EnableEtags {
+		if s.previousJobs[repoName] != nil {
+			return s.previousJobs[repoName], nil
+		}
+
+		return nil, fmt.Errorf("request for jobs returned status: %d %s but previous jobs is not set", statusCode, http.StatusText(statusCode))
 	}
 
 	var jobs Jobs
@@ -564,23 +555,42 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 		return nil, err
 	}
 
+	if s.metadata.EnableEtags {
+		s.previousJobs[repoName] = jobs.Jobs
+	}
+
 	return jobs.Jobs, nil
 }
 
 // getWorkflowRuns returns a list of workflow runs for a given repository
-func (s *githubRunnerScaler) getWorkflowRuns(ctx context.Context, repoName string) (*WorkflowRuns, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/actions/runs", s.metadata.githubAPIURL, s.metadata.owner, repoName)
-	body, statusCode, err := getGithubRequest(ctx, url, s.metadata, s.httpClient)
+func (s *githubRunnerScaler) getWorkflowRuns(ctx context.Context, repoName string, status string) (*WorkflowRuns, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/actions/runs?status=%s&per_page=100", s.metadata.GithubAPIURL, s.metadata.Owner, repoName, status)
+	body, statusCode, err := s.getGithubRequest(ctx, url, s.metadata, s.httpClient)
 	if err != nil && statusCode == 404 {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
+	}
+	if statusCode == 304 && s.metadata.EnableEtags {
+		if s.previousWfrs[repoName][status] != nil {
+			return s.previousWfrs[repoName][status], nil
+		}
+
+		return nil, fmt.Errorf("request for workflow runs returned status: %d %s but previous workflow runs is not set. Repo: %s, Status: %s", statusCode, http.StatusText(statusCode), repoName, status)
 	}
 
 	var wfrs WorkflowRuns
 	err = json.Unmarshal(body, &wfrs)
 	if err != nil {
 		return nil, err
+	}
+
+	if s.metadata.EnableEtags {
+		if _, repoFound := s.previousWfrs[repoName]; !repoFound {
+			s.previousWfrs[repoName] = map[string]*WorkflowRuns{status: &wfrs}
+		} else {
+			s.previousWfrs[repoName][status] = &wfrs
+		}
 	}
 
 	return &wfrs, nil
@@ -596,9 +606,13 @@ func contains(s []string, e string) bool {
 }
 
 // canRunnerMatchLabels check Agent Label array will match runner label array
-func canRunnerMatchLabels(jobLabels []string, runnerLabels []string) bool {
+func canRunnerMatchLabels(jobLabels []string, runnerLabels []string, noDefaultLabels bool) bool {
+	allLabels := runnerLabels
+	if !noDefaultLabels {
+		allLabels = append(allLabels, reservedLabels...)
+	}
 	for _, jobLabel := range jobLabels {
-		if !contains(runnerLabels, jobLabel) && !contains(reservedLabels, jobLabel) {
+		if !contains(allLabels, jobLabel) {
 			return false
 		}
 	}
@@ -618,12 +632,19 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 	var allWfrs []WorkflowRuns
 
 	for _, repo := range repos {
-		wfrs, err := s.getWorkflowRuns(ctx, repo)
+		wfrsQueued, err := s.getWorkflowRuns(ctx, repo, "queued")
 		if err != nil {
 			return -1, err
 		}
-		if wfrs != nil {
-			allWfrs = append(allWfrs, *wfrs)
+		if wfrsQueued != nil {
+			allWfrs = append(allWfrs, *wfrsQueued)
+		}
+		wfrsInProgress, err := s.getWorkflowRuns(ctx, repo, "in_progress")
+		if err != nil {
+			return -1, err
+		}
+		if wfrsInProgress != nil {
+			allWfrs = append(allWfrs, *wfrsInProgress)
 		}
 	}
 
@@ -636,7 +657,7 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 			return -1, err
 		}
 		for _, job := range jobs {
-			if job.Status == "queued" && canRunnerMatchLabels(job.Labels, s.metadata.labels) {
+			if (job.Status == "queued" || job.Status == "in_progress") && canRunnerMatchLabels(job.Labels, s.metadata.Labels, s.metadata.NoDefaultLabels) {
 				queueCount++
 			}
 		}
@@ -655,20 +676,23 @@ func (s *githubRunnerScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 
 	metric := GenerateMetricInMili(metricName, float64(queueLen))
 
-	return []external_metrics.ExternalMetricValue{metric}, queueLen >= s.metadata.targetWorkflowQueueLength, nil
+	return []external_metrics.ExternalMetricValue{metric}, queueLen >= s.metadata.TargetWorkflowQueueLength, nil
 }
 
 func (s *githubRunnerScaler) GetMetricSpecForScaling(_ context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("github-runner-%s", s.metadata.owner))),
+			Name: GenerateMetricNameWithIndex(s.metadata.TriggerIndex, kedautil.NormalizeString(fmt.Sprintf("github-runner-%s", s.metadata.Owner))),
 		},
-		Target: GetMetricTarget(s.metricType, s.metadata.targetWorkflowQueueLength),
+		Target: GetMetricTarget(s.metricType, s.metadata.TargetWorkflowQueueLength),
 	}
 	metricSpec := v2.MetricSpec{External: externalMetric, Type: externalMetricType}
 	return []v2.MetricSpec{metricSpec}
 }
 
 func (s *githubRunnerScaler) Close(_ context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }

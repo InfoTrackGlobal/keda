@@ -2,28 +2,42 @@ package scalers
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 	"github.com/go-logr/logr"
+
+	kafka_oauth "github.com/kedacore/keda/v2/pkg/scalers/kafka"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseKafkaMetadataTestData struct {
-	metadata             map[string]string
-	isError              bool
-	numBrokers           int
-	brokers              []string
-	group                string
-	topic                string
-	partitionLimitation  []int32
-	offsetResetPolicy    offsetResetPolicy
-	allowIdleConsumers   bool
-	excludePersistentLag bool
+	metadata                 map[string]string
+	isError                  bool
+	numBrokers               int
+	brokers                  []string
+	group                    string
+	topic                    string
+	partitionLimitation      []int32
+	offsetResetPolicy        offsetResetPolicy
+	allowIdleConsumers       bool
+	excludePersistentLag     bool
+	limitToPartitionsWithLag bool
 }
 
 type parseKafkaAuthParamsTestData struct {
+	authParams map[string]string
+	isError    bool
+	enableTLS  bool
+}
+
+type parseKafkaOAuthbearerAuthParamsTestData = struct {
+	metadata   map[string]string
 	authParams map[string]string
 	isError    bool
 	enableTLS  bool
@@ -39,7 +53,7 @@ type parseAuthParamsTestDataSecondAuthMethod struct {
 
 type kafkaMetricIdentifier struct {
 	metadataTestData *parseKafkaMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -63,55 +77,67 @@ var validWithoutAuthParams = map[string]string{}
 
 var parseKafkaMetadataTestDataset = []parseKafkaMetadataTestData{
 	// failure, no bootstrapServers
-	{map[string]string{}, true, 0, nil, "", "", nil, "", false, false},
+	{map[string]string{}, true, 0, nil, "", "", nil, "", false, false, false},
 	// failure, no consumer group
-	{map[string]string{"bootstrapServers": "foobar:9092"}, true, 1, []string{"foobar:9092"}, "", "", nil, "latest", false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092"}, true, 1, []string{"foobar:9092"}, "", "", nil, "latest", false, false, false},
 	// success, no topic
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group"}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group"}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, ignore partitionLimitation if no topic
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "partitionLimitation": "1,2,3,4,5,6"}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "partitionLimitation": "1,2,3,4,5,6"}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, no limitation with whitespaced limitation value
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "partitionLimitation": "           "}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "partitionLimitation": "           "}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, no limitation
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "partitionLimitation": ""}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "partitionLimitation": ""}, false, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false, false},
 	// failure, version not supported
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "version": "1.2.3.4"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "version": "1.2.3.4"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// failure, lagThreshold is negative value
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "-1"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "-1"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// failure, lagThreshold is 0
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "0"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "0"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
+	// success, lagThreshold is 1000000
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "1000000", "activationLagThreshold": "0"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// failure, activationLagThreshold is not int
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "10", "activationLagThreshold": "AA"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "10", "activationLagThreshold": "AA"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, activationLagThreshold is 0
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "10", "activationLagThreshold": "0"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "lagThreshold": "10", "activationLagThreshold": "0"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, partitionLimitation as list
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1,2,3,4"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", []int32{1, 2, 3, 4}, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1,2,3,4"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", []int32{1, 2, 3, 4}, offsetResetPolicy("latest"), false, false, false},
 	// success, partitionLimitation as range
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1-4"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", []int32{1, 2, 3, 4}, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1-4"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", []int32{1, 2, 3, 4}, offsetResetPolicy("latest"), false, false, false},
 	// success, partitionLimitation mixed list + ranges
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1-4,8,10-12"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", []int32{1, 2, 3, 4, 8, 10, 11, 12}, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1-4,8,10-12"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", []int32{1, 2, 3, 4, 8, 10, 11, 12}, offsetResetPolicy("latest"), false, false, false},
 	// failure, partitionLimitation wrong data type
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "a,b,c,d"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "a,b,c,d"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, more brokers
-	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic"}, false, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic"}, false, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, offsetResetPolicy policy latest
-	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic", "offsetResetPolicy": "latest"}, false, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic", "offsetResetPolicy": "latest"}, false, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// failure, offsetResetPolicy policy wrong
-	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic", "offsetResetPolicy": "foo"}, true, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, "", false, false},
+	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic", "offsetResetPolicy": "foo"}, true, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, "", false, false, false},
 	// success, offsetResetPolicy policy earliest
-	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic", "offsetResetPolicy": "earliest"}, false, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("earliest"), false, false},
+	{map[string]string{"bootstrapServers": "foo:9092,bar:9092", "consumerGroup": "my-group", "topic": "my-topic", "offsetResetPolicy": "earliest"}, false, 2, []string{"foo:9092", "bar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("earliest"), false, false, false},
 	// failure, allowIdleConsumers malformed
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "notvalid"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "notvalid"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, allowIdleConsumers is true
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), true, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), true, false, false},
 	// failure, excludePersistentLag is malformed
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "excludePersistentLag": "notvalid"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "excludePersistentLag": "notvalid"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
 	// success, excludePersistentLag is true
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "excludePersistentLag": "true"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, true},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "excludePersistentLag": "true"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, true, false},
 	// success, version supported
-	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), true, false},
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), true, false, false},
+	// success, limitToPartitionsWithLag is true
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "limitToPartitionsWithLag": "true"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, true},
+	// failure, limitToPartitionsWithLag is malformed
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "limitToPartitionsWithLag": "notvalid"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), false, false, false},
+	// failure, allowIdleConsumers and limitToPartitionsWithLag cannot be set to true simultaneously
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "limitToPartitionsWithLag": "true"}, true, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), true, false, true},
+	// success, allowIdleConsumers can be set when limitToPartitionsWithLag is false
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "limitToPartitionsWithLag": "false"}, false, 1, []string{"foobar:9092"}, "my-group", "my-topic", nil, offsetResetPolicy("latest"), true, false, false},
+	// failure, topic must be specified when limitToPartitionsWithLag is true
+	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "limitToPartitionsWithLag": "true"}, true, 1, []string{"foobar:9092"}, "my-group", "", nil, offsetResetPolicy("latest"), false, false, true},
 }
 
 var parseKafkaAuthParamsTestDataset = []parseKafkaAuthParamsTestData{
@@ -135,6 +161,16 @@ var parseKafkaAuthParamsTestDataset = []parseKafkaAuthParamsTestData{
 	{map[string]string{"sasl": "plaintext", "username": "admin", "password": "admin", "tls": "disable"}, false, false},
 	// success, SASL OAUTHBEARER + TLS
 	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
+	// success, SASL GSSAPI/password
+	{map[string]string{"sasl": "gssapi", "username": "admin", "password": "admin", "kerberosConfig": "<config>", "realm": "tst.com"}, false, false},
+	// success, SASL GSSAPI/keytab
+	{map[string]string{"sasl": "gssapi", "username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com"}, false, false},
+	// success, SASL GSSAPI/password + TLS
+	{map[string]string{"sasl": "gssapi", "username": "admin", "password": "admin", "kerberosConfig": "<config>", "realm": "tst.com", "tls": "enable", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, true},
+	// success, SASL GSSAPI/keytab + TLS
+	{map[string]string{"sasl": "gssapi", "username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com", "tls": "enable", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, true},
+	// success, SASL GSSAPI, KerberosServiceName supported
+	{map[string]string{"sasl": "gssapi", "username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com", "kerberosServiceName": "srckafka"}, false, false},
 	// failure, SASL OAUTHBEARER + TLS bad sasl type
 	{map[string]string{"sasl": "foo", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, true, false},
 	// success, SASL OAUTHBEARER + TLS missing scope
@@ -165,6 +201,18 @@ var parseKafkaAuthParamsTestDataset = []parseKafkaAuthParamsTestData{
 	{map[string]string{"sasl": "plaintext", "username": "admin", "password": "admin", "tls": "enable", "ca": "caaa", "key": "keey"}, true, false},
 	// failure, SASL + TLS, missing key
 	{map[string]string{"sasl": "plaintext", "username": "admin", "password": "admin", "tls": "enable", "ca": "caaa", "cert": "ceert"}, true, false},
+	// failure, SASL GSSAPI missing password and keytab
+	{map[string]string{"sasl": "gssapi", "username": "admin", "kerberosConfig": "<config>", "realm": "tst.com"}, true, false},
+	// failure, SASL GSSAPI provided both password and keytab
+	{map[string]string{"sasl": "gssapi", "username": "admin", "password": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com"}, true, false},
+	// failure, SASL GSSAPI/password + TLS missing realm
+	{map[string]string{"sasl": "gssapi", "username": "admin", "password": "admin", "kerberosConfig": "<config>", "tls": "enable", "ca": "caaa", "cert": "ceert", "key": "keey"}, true, false},
+	// failure, SASL GSSAPI/keytab + TLS missing username
+	{map[string]string{"sasl": "gssapi", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com", "tls": "enable", "ca": "caaa", "cert": "ceert", "key": "keey"}, true, false},
+	// success, SASL GSSAPI/disableFast
+	{map[string]string{"sasl": "gssapi", "username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com", "kerberosDisableFAST": "true"}, false, false},
+	// failure, SASL GSSAPI/disableFast incorrect
+	{map[string]string{"sasl": "gssapi", "username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "tst.com", "kerberosDisableFAST": "notabool"}, true, false},
 }
 var parseAuthParamsTestDataset = []parseAuthParamsTestDataSecondAuthMethod{
 	// success, SASL plaintext
@@ -181,12 +229,26 @@ var parseAuthParamsTestDataset = []parseAuthParamsTestDataSecondAuthMethod{
 	{map[string]string{"tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"cert": "ceert", "key": "keey", "keyPassword": "keeyPassword"}, false, true},
 	// success, TLS CA only
 	{map[string]string{"tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"ca": "caaa"}, false, true},
+	// success, TLS CA only and unsafeSSL
+	{map[string]string{"tls": "enable", "unsafeSsl": "true", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"ca": "caaa"}, false, true},
 	// success, SASL + TLS
 	{map[string]string{"sasl": "plaintext", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, true},
 	// success, SASL + TLS explicitly disabled
 	{map[string]string{"sasl": "plaintext", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin"}, false, false},
 	// success, SASL OAUTHBEARER + TLS explicitly disabled
 	{map[string]string{"sasl": "oauthbearer", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com"}, false, false},
+	// success, SASL GSSAPI/password
+	{map[string]string{"sasl": "gssapi", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "kerberosConfig": "<config>", "realm": "test.com"}, false, false},
+	// success, SASL GSSAPI/password + TLS explicitly disabled
+	{map[string]string{"sasl": "gssapi", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "kerberosConfig": "<config>", "realm": "test.com"}, false, false},
+	// success, SASL GSSAPI/password + TLS
+	{map[string]string{"sasl": "gssapi", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "kerberosConfig": "<config>", "realm": "test.com", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, false},
+	// success, SASL GSSAPI/keytab
+	{map[string]string{"sasl": "gssapi", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "test.com"}, false, false},
+	// success, SASL GSSAPI/keytab + TLS explicitly disabled
+	{map[string]string{"sasl": "gssapi", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "test.com"}, false, false},
+	// success, SASL GSSAPI/keytab + TLS
+	{map[string]string{"sasl": "gssapi", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "keytab": "/path/to/keytab", "kerberosConfig": "<config>", "realm": "test.com", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, false},
 	// failure, SASL OAUTHBEARER + TLS explicitly disable +  bad SASL type
 	{map[string]string{"sasl": "foo", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com"}, true, false},
 	// success, SASL OAUTHBEARER + TLS missing scope
@@ -216,8 +278,17 @@ var parseAuthParamsTestDataset = []parseAuthParamsTestDataSecondAuthMethod{
 	// failure, SASL + TLS, missing cert
 	{map[string]string{"sasl": "plaintext", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "ca": "caaa", "key": "keey"}, true, false},
 	// failure, SASL + TLS, missing key
-	{map[string]string{"sasl": "plaintext", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"sasl": "plaintext", "username": "admin", "password": "admin", "ca": "caaa", "cert": "ceert"}, true, false},
-
+	{map[string]string{"sasl": "plaintext", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"sasl": "plaintext", "username": "admin", "password": "admin", "ca": "caaa", "cert": "ceert"}, true, true},
+	// failure, SASL GSSAPI missing keytab and password
+	{map[string]string{"sasl": "gssapi", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "realm": "test.com"}, true, false},
+	// failure, SASL GSSAPI values in both keytab and password
+	{map[string]string{"sasl": "gssapi", "tls": "disable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "password": "admin", "keytab": "/path/to/keytab", "realm": "test.com"}, true, false},
+	// failure, SASL GSSAPI + TLS missing realm
+	{map[string]string{"sasl": "gssapi", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "keytab": "/path/to/keytab", "ca": "caaa", "cert": "ceert", "key": "keey"}, true, true},
+	// failure, SASL GSSAPI + TLS missing username
+	{map[string]string{"sasl": "gssapi", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"realm": "test.com", "keytab": "/path/to/keytab", "ca": "caaa", "cert": "ceert", "key": "keey"}, true, true},
+	// failure, SASL GSSAPI + TLS missing kerberosConfig
+	{map[string]string{"sasl": "gssapi", "tls": "enable", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"username": "admin", "realm": "test.com", "keytab": "/path/to/keytab", "ca": "caaa", "cert": "ceert", "key": "keey"}, true, true},
 	// failure, setting SASL values in both places
 	{map[string]string{"sasl": "scram_sha512", "bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"sasl": "scram_sha512", "username": "admin", "password": "admin"}, true, false},
 	// failure, setting TLS values in both places
@@ -236,99 +307,100 @@ var parseAuthParamsTestDataset = []parseAuthParamsTestDataSecondAuthMethod{
 	{map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "allowIdleConsumers": "true", "version": "1.0.0"}, map[string]string{"sasl": "scram_sha512 ", "username": "admin", "password": "admin"}, false, true},
 }
 
-var parseKafkaOAuthbrearerAuthParamsTestDataset = []parseKafkaAuthParamsTestData{
+var parseKafkaOAuthbearerAuthParamsTestDataset = []parseKafkaOAuthbearerAuthParamsTestData{
 	// success, SASL OAUTHBEARER + TLS
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
+	// success, SASL OAUTHBEARER + tokenProvider + TLS
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "bearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
 	// success, SASL OAUTHBEARER + TLS multiple scopes
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope1, scope2", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope1, scope2", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
 	// success, SASL OAUTHBEARER + TLS missing scope
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, false, false},
 	// failure, SASL OAUTHBEARER + TLS bad sasl type
-	{map[string]string{"sasl": "foo", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, true, false},
+	{map[string]string{}, map[string]string{"sasl": "foo", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable"}, true, false},
 	// failure, SASL OAUTHBEARER + TLS missing oauthTokenEndpointUri
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "", "tls": "disable"}, true, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "", "tls": "disable"}, true, false},
 	// success, SASL OAUTHBEARER + extension
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable", "oauthExtensions": "extension_foo=bar"}, false, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable", "oauthExtensions": "extension_foo=bar"}, false, false},
 	// success, SASL OAUTHBEARER + multiple extensions
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable", "oauthExtensions": "extension_foo=bar,extension_baz=baz"}, false, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable", "oauthExtensions": "extension_foo=bar,extension_baz=baz"}, false, false},
 	// failure, SASL OAUTHBEARER + bad extension
-	{map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable", "oauthExtensions": "extension_foo=bar,extension_bazbaz"}, true, false},
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "scopes": "scope", "oauthTokenEndpointUri": "https://website.com", "tls": "disable", "oauthExtensions": "extension_foo=bar,extension_bazbaz"}, true, false},
+	// success, SASL OAUTHBEARER MSK + TLS + Credentials
+	{map[string]string{"awsRegion": "eu-west-1"}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "aws_msk_iam", "tls": "enable", "awsAccessKeyID": "none", "awsSecretAccessKey": "none"}, false, true},
+	// success, SASL OAUTHBEARER MSK + TLS + Role
+	{map[string]string{"awsRegion": "eu-west-1"}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "aws_msk_iam", "tls": "enable", "awsRegion": "eu-west-1", "awsRoleArn": "none"}, false, true},
+	// failure, SASL OAUTHBEARER MSK + no TLS
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "aws_msk_iam", "tls": "disable"}, true, false},
+	// failure, SASL OAUTHBEARER MSK + TLS + no region
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "aws_msk_iam", "tls": "enable", "awsRegion": ""}, true, true},
+	// failure, SASL OAUTHBEARER MSK + TLS + no credentials
+	{map[string]string{}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "aws_msk_iam", "tls": "enable", "awsRegion": "eu-west-1"}, true, true},
 }
 
 var kafkaMetricIdentifiers = []kafkaMetricIdentifier{
-	{&parseKafkaMetadataTestDataset[10], 0, "s0-kafka-my-topic"},
-	{&parseKafkaMetadataTestDataset[10], 1, "s1-kafka-my-topic"},
+	{&parseKafkaMetadataTestDataset[11], 0, "s0-kafka-my-topic"},
+	{&parseKafkaMetadataTestDataset[11], 1, "s1-kafka-my-topic"},
 	{&parseKafkaMetadataTestDataset[2], 1, "s1-kafka-my-group-topics"},
 }
 
 func TestGetBrokers(t *testing.T) {
 	for _, testData := range parseKafkaMetadataTestDataset {
-		meta, err := parseKafkaMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: validWithAuthParams}, logr.Discard())
+		meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: validWithAuthParams}, logr.Discard())
+		getBrokerTestBase(t, meta, testData, err)
 
-		if err != nil && !testData.isError {
-			t.Error("Expected success but got error", err)
-		}
-		if testData.isError && err == nil {
-			t.Error("Expected error but got success")
-		}
-		if len(meta.bootstrapServers) != testData.numBrokers {
-			t.Errorf("Expected %d bootstrap servers but got %d\n", testData.numBrokers, len(meta.bootstrapServers))
-		}
-		if !reflect.DeepEqual(testData.brokers, meta.bootstrapServers) {
-			t.Errorf("Expected %v but got %v\n", testData.brokers, meta.bootstrapServers)
-		}
-		if meta.group != testData.group {
-			t.Errorf("Expected group %s but got %s\n", testData.group, meta.group)
-		}
-		if meta.topic != testData.topic {
-			t.Errorf("Expected topic %s but got %s\n", testData.topic, meta.topic)
-		}
-		if !reflect.DeepEqual(testData.partitionLimitation, meta.partitionLimitation) {
-			t.Errorf("Expected %v but got %v\n", testData.partitionLimitation, meta.partitionLimitation)
-		}
-		if err == nil && meta.offsetResetPolicy != testData.offsetResetPolicy {
-			t.Errorf("Expected offsetResetPolicy %s but got %s\n", testData.offsetResetPolicy, meta.offsetResetPolicy)
-		}
-
-		meta, err = parseKafkaMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: validWithoutAuthParams}, logr.Discard())
-
-		if err != nil && !testData.isError {
-			t.Error("Expected success but got error", err)
-		}
-		if testData.isError && err == nil {
-			t.Error("Expected error but got success")
-		}
-		if len(meta.bootstrapServers) != testData.numBrokers {
-			t.Errorf("Expected %d bootstrap servers but got %d\n", testData.numBrokers, len(meta.bootstrapServers))
-		}
-		if !reflect.DeepEqual(testData.brokers, meta.bootstrapServers) {
-			t.Errorf("Expected %v but got %v\n", testData.brokers, meta.bootstrapServers)
-		}
-		if meta.group != testData.group {
-			t.Errorf("Expected group %s but got %s\n", testData.group, meta.group)
-		}
-		if meta.topic != testData.topic {
-			t.Errorf("Expected topic %s but got %s\n", testData.topic, meta.topic)
-		}
-		if !reflect.DeepEqual(testData.partitionLimitation, meta.partitionLimitation) {
-			t.Errorf("Expected %v but got %v\n", testData.partitionLimitation, meta.partitionLimitation)
-		}
-		if err == nil && meta.offsetResetPolicy != testData.offsetResetPolicy {
-			t.Errorf("Expected offsetResetPolicy %s but got %s\n", testData.offsetResetPolicy, meta.offsetResetPolicy)
-		}
-		if err == nil && meta.allowIdleConsumers != testData.allowIdleConsumers {
-			t.Errorf("Expected allowIdleConsumers %t but got %t\n", testData.allowIdleConsumers, meta.allowIdleConsumers)
-		}
-		if err == nil && meta.excludePersistentLag != testData.excludePersistentLag {
-			t.Errorf("Expected excludePersistentLag %t but got %t\n", testData.excludePersistentLag, meta.excludePersistentLag)
-		}
+		meta, err = parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: validWithoutAuthParams}, logr.Discard())
+		getBrokerTestBase(t, meta, testData, err)
 	}
 }
 
-func TestKafkaAuthParams(t *testing.T) {
-	// Testing tls and sasl value in TriggerAuthentication
+func getBrokerTestBase(t *testing.T, meta kafkaMetadata, testData parseKafkaMetadataTestData, err error) {
+	if err != nil && !testData.isError {
+		t.Error("Expected success but got error", err)
+	}
+	if testData.isError && err == nil {
+		t.Error("Expected error but got success")
+	}
+	if len(meta.bootstrapServers) != testData.numBrokers {
+		t.Errorf("Expected %d bootstrap servers but got %d\n", testData.numBrokers, len(meta.bootstrapServers))
+	}
+	if !reflect.DeepEqual(testData.brokers, meta.bootstrapServers) {
+		t.Errorf("Expected %v but got %v\n", testData.brokers, meta.bootstrapServers)
+	}
+	if meta.group != testData.group {
+		t.Errorf("Expected group %s but got %s\n", testData.group, meta.group)
+	}
+	if meta.topic != testData.topic {
+		t.Errorf("Expected topic %s but got %s\n", testData.topic, meta.topic)
+	}
+	if !reflect.DeepEqual(testData.partitionLimitation, meta.partitionLimitation) {
+		t.Errorf("Expected %v but got %v\n", testData.partitionLimitation, meta.partitionLimitation)
+	}
+	if err == nil && meta.offsetResetPolicy != testData.offsetResetPolicy {
+		t.Errorf("Expected offsetResetPolicy %s but got %s\n", testData.offsetResetPolicy, meta.offsetResetPolicy)
+	}
+	if err == nil && meta.allowIdleConsumers != testData.allowIdleConsumers {
+		t.Errorf("Expected allowIdleConsumers %t but got %t\n", testData.allowIdleConsumers, meta.allowIdleConsumers)
+	}
+	if err == nil && meta.excludePersistentLag != testData.excludePersistentLag {
+		t.Errorf("Expected excludePersistentLag %t but got %t\n", testData.excludePersistentLag, meta.excludePersistentLag)
+	}
+	if err == nil && meta.limitToPartitionsWithLag != testData.limitToPartitionsWithLag {
+		t.Errorf("Expected limitToPartitionsWithLag %t but got %t\n", testData.limitToPartitionsWithLag, meta.limitToPartitionsWithLag)
+	}
+	expectedLagThreshold, er := parseExpectedLagThreshold(testData.metadata)
+	if er != nil {
+		t.Errorf("Unable to convert test data lagThreshold %s to string", testData.metadata["lagThreshold"])
+	}
+
+	if meta.lagThreshold != expectedLagThreshold && meta.lagThreshold != defaultKafkaLagThreshold {
+		t.Errorf("Expected lagThreshold to be either %v or %v got %v ", meta.lagThreshold, defaultKafkaLagThreshold, expectedLagThreshold)
+	}
+}
+
+func TestKafkaAuthParamsInTriggerAuthentication(t *testing.T) {
 	for _, testData := range parseKafkaAuthParamsTestDataset {
-		meta, err := parseKafkaMetadata(&ScalerConfig{TriggerMetadata: validKafkaMetadata, AuthParams: testData.authParams}, logr.Discard())
+		meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: validKafkaMetadata, AuthParams: testData.authParams}, logr.Discard())
 
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
@@ -336,7 +408,7 @@ func TestKafkaAuthParams(t *testing.T) {
 		if testData.isError && err == nil {
 			t.Error("Expected error but got success")
 		}
-		if meta.enableTLS != testData.enableTLS {
+		if !testData.isError && meta.enableTLS != testData.enableTLS {
 			t.Errorf("Expected enableTLS to be set to %v but got %v\n", testData.enableTLS, meta.enableTLS)
 		}
 		if meta.enableTLS {
@@ -353,11 +425,29 @@ func TestKafkaAuthParams(t *testing.T) {
 				t.Errorf("Expected key to be set to %v but got %v\n", testData.authParams["keyPassword"], meta.key)
 			}
 		}
+		if meta.saslType == KafkaSASLTypeGSSAPI && !testData.isError {
+			if testData.authParams["keytab"] != "" {
+				err := testFileContents(testData, meta, "keytab")
+				if err != nil {
+					t.Error(err.Error())
+				}
+			}
+			if !testData.isError {
+				err := testFileContents(testData, meta, "kerberosConfig")
+				if err != nil {
+					t.Error(err.Error())
+				}
+			}
+			if meta.kerberosServiceName != testData.authParams["kerberosServiceName"] {
+				t.Errorf("Expected kerberos ServiceName to be set to %v but got %v\n", testData.authParams["kerberosServiceName"], meta.kerberosServiceName)
+			}
+		}
 	}
+}
 
-	// Testing tls and sasl value in scaledObject
+func TestKafkaAuthParamsInScaledObject(t *testing.T) {
 	for id, testData := range parseAuthParamsTestDataset {
-		meta, err := parseKafkaMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams}, logr.Discard())
+		meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams}, logr.Discard())
 
 		if err != nil && !testData.isError {
 			t.Errorf("Test case: %v. Expected success but got error %v", id, err)
@@ -382,37 +472,138 @@ func TestKafkaAuthParams(t *testing.T) {
 				if meta.keyPassword != testData.authParams["keyPassword"] {
 					t.Errorf("Test case: %v. Expected key to be set to %v but got %v\n", id, testData.authParams["keyPassword"], meta.keyPassword)
 				}
+				if val, ok := testData.authParams["unsafeSsl"]; ok && err == nil {
+					boolVal, err := strconv.ParseBool(val)
+					if err != nil && !testData.isError {
+						t.Errorf("Expect error but got success in test case %s", meta.key)
+					}
+					if boolVal != meta.unsafeSsl {
+						t.Errorf("Expected unsafeSsl key to be set to %v but got %v\n", boolVal, meta.unsafeSsl)
+					}
+				}
 			}
 		}
 	}
 }
 
-func TestKafkaOAuthbrearerAuthParams(t *testing.T) {
-	for _, testData := range parseKafkaOAuthbrearerAuthParamsTestDataset {
-		meta, err := parseKafkaMetadata(&ScalerConfig{TriggerMetadata: validKafkaMetadata, AuthParams: testData.authParams}, logr.Discard())
+func testFileContents(testData parseKafkaAuthParamsTestData, meta kafkaMetadata, prop string) error {
+	if testData.authParams[prop] != "" {
+		var path string
+		switch prop {
+		case "keytab":
+			path = meta.keytabPath
+		case "kerberosConfig":
+			path = meta.kerberosConfigPath
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("expected to find '%v' file at %v", prop, path)
+		}
+		contents := string(data)
+		if contents != testData.authParams[prop] {
+			return fmt.Errorf("expected keytab value: '%v' but got '%v'", testData.authParams[prop], contents)
+		}
+	}
+	return nil
+}
+
+func TestKafkaOAuthbearerAuthParams(t *testing.T) {
+	for _, testData := range parseKafkaOAuthbearerAuthParamsTestDataset {
+		for k, v := range validKafkaMetadata {
+			testData.metadata[k] = v
+		}
+
+		meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams}, logr.Discard())
 
 		if err != nil && !testData.isError {
-			t.Error("Expected success but got error", err)
+			t.Fatal("Expected success but got error", err)
 		}
 		if testData.isError && err == nil {
-			t.Error("Expected error but got success")
+			t.Fatal("Expected error but got success")
 		}
-		if testData.authParams["scopes"] == "" {
-			if len(meta.scopes) != strings.Count(testData.authParams["scopes"], ",")+1 {
-				t.Errorf("Expected scopes to be set to %v but got %v\n", strings.Count(testData.authParams["scopes"], ","), len(meta.scopes))
+
+		if testData.authParams["saslTokenProvider"] == "" || testData.authParams["saslTokenProvider"] == "bearer" {
+			if !testData.isError && meta.tokenProvider != KafkaSASLOAuthTokenProviderBearer {
+				t.Errorf("Expected tokenProvider to be set to %v but got %v\n", KafkaSASLOAuthTokenProviderBearer, meta.tokenProvider)
+			}
+
+			if testData.authParams["scopes"] == "" {
+				if len(meta.scopes) != strings.Count(testData.authParams["scopes"], ",")+1 {
+					t.Errorf("Expected scopes to be set to %v but got %v\n", strings.Count(testData.authParams["scopes"], ","), len(meta.scopes))
+				}
+			}
+
+			if err == nil && testData.authParams["oauthExtensions"] != "" {
+				if len(meta.oauthExtensions) != strings.Count(testData.authParams["oauthExtensions"], ",")+1 {
+					t.Errorf("Expected number of extensions to be set to %v but got %v\n", strings.Count(testData.authParams["oauthExtensions"], ",")+1, len(meta.oauthExtensions))
+				}
+			}
+		} else if testData.authParams["saslTokenProvider"] == "aws_msk_iam" {
+			if !testData.isError && meta.tokenProvider != KafkaSASLOAuthTokenProviderAWSMSKIAM {
+				t.Errorf("Expected tokenProvider to be set to %v but got %v\n", KafkaSASLOAuthTokenProviderAWSMSKIAM, meta.tokenProvider)
+			}
+
+			if testData.metadata["awsRegion"] != "" && meta.awsRegion != testData.metadata["awsRegion"] {
+				t.Errorf("Expected awsRegion to be set to %v but got %v\n", testData.metadata["awsRegion"], meta.awsRegion)
+			}
+
+			if testData.authParams["awsAccessKeyID"] != "" {
+				if meta.awsAuthorization.AwsAccessKeyID != testData.authParams["awsAccessKeyID"] {
+					t.Errorf("Expected awsAccessKeyID to be set to %v but got %v\n", testData.authParams["awsAccessKeyID"], meta.awsAuthorization.AwsAccessKeyID)
+				}
+
+				if meta.awsAuthorization.AwsSecretAccessKey != testData.authParams["awsSecretAccessKey"] {
+					t.Errorf("Expected awsSecretAccessKey to be set to %v but got %v\n", testData.authParams["awsSecretAccessKey"], meta.awsAuthorization.AwsSecretAccessKey)
+				}
+			} else if testData.authParams["awsRoleArn"] != "" && meta.awsAuthorization.AwsRoleArn != testData.authParams["awsRoleArn"] {
+				t.Errorf("Expected awsRoleArn to be set to %v but got %v\n", testData.authParams["awsRoleArn"], meta.awsAuthorization.AwsRoleArn)
 			}
 		}
-		if err == nil && testData.authParams["oauthExtensions"] != "" {
-			if len(meta.oauthExtensions) != strings.Count(testData.authParams["oauthExtensions"], ",")+1 {
-				t.Errorf("Expected number of extensions to be set to %v but got %v\n", strings.Count(testData.authParams["oauthExtensions"], ",")+1, len(meta.oauthExtensions))
+	}
+}
+
+func TestKafkaClientsOAuthTokenProvider(t *testing.T) {
+	testData := []struct {
+		name                  string
+		metadata              map[string]string
+		authParams            map[string]string
+		expectedTokenProvider string
+	}{
+		{"oauthbearer_bearer", map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1,2"}, map[string]string{"sasl": "oauthbearer", "username": "admin", "password": "admin", "oauthTokenEndpointUri": "https://website.com"}, "OAuthBearer"},
+		{"oauthbearer_aws_msk_iam", map[string]string{"bootstrapServers": "foobar:9092", "consumerGroup": "my-group", "topic": "my-topic", "partitionLimitation": "1,2", "tls": "enable", "awsRegion": "eu-west-1"}, map[string]string{"sasl": "oauthbearer", "saslTokenProvider": "aws_msk_iam", "awsRegion": "eu-west-1", "awsAccessKeyID": "none", "awsSecretAccessKey": "none"}, "MSK"},
+	}
+
+	for _, tt := range testData {
+		t.Run(tt.name, func(t *testing.T) {
+			meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: tt.metadata, AuthParams: tt.authParams}, logr.Discard())
+			if err != nil {
+				t.Fatal("Could not parse metadata:", err)
 			}
-		}
+
+			cfg, err := getKafkaClientConfig(context.TODO(), meta)
+			if err != nil {
+				t.Error("Expected success but got error", err)
+			}
+
+			if !cfg.Net.SASL.Enable {
+				t.Error("Expected SASL to be enabled on client")
+			}
+
+			tokenProvider, ok := cfg.Net.SASL.TokenProvider.(kafka_oauth.TokenProvider)
+			if !ok {
+				t.Error("Expected token provider to be set on client")
+			}
+
+			if tokenProvider.String() != tt.expectedTokenProvider {
+				t.Errorf("Expected token provider to be %v but got %v", tt.expectedTokenProvider, tokenProvider.String())
+			}
+		})
 	}
 }
 
 func TestKafkaGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range kafkaMetricIdentifiers {
-		meta, err := parseKafkaMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, AuthParams: validWithAuthParams, ScalerIndex: testData.scalerIndex}, logr.Discard())
+		meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, AuthParams: validWithAuthParams, TriggerIndex: testData.triggerIndex}, logr.Discard())
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -440,7 +631,7 @@ func TestGetTopicPartitions(t *testing.T) {
 
 	for _, tt := range testData {
 		t.Run(tt.name, func(t *testing.T) {
-			meta, err := parseKafkaMetadata(&ScalerConfig{TriggerMetadata: tt.metadata, AuthParams: validWithAuthParams}, logr.Discard())
+			meta, err := parseKafkaMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: tt.metadata, AuthParams: validWithAuthParams}, logr.Discard())
 			if err != nil {
 				t.Fatal("Could not parse metadata:", err)
 			}
@@ -458,6 +649,8 @@ func TestGetTopicPartitions(t *testing.T) {
 		})
 	}
 }
+
+var _ sarama.ClusterAdmin = (*MockClusterAdmin)(nil)
 
 type MockClusterAdmin struct {
 	partitionIds []int32
@@ -532,6 +725,10 @@ func (m *MockClusterAdmin) DeleteACL(_ sarama.AclFilter, _ bool) ([]sarama.Match
 	return nil, nil
 }
 
+func (m *MockClusterAdmin) ElectLeaders(sarama.ElectionType, map[string][]int32) (map[string]map[int32]*sarama.PartitionResult, error) {
+	return nil, nil
+}
+
 func (m *MockClusterAdmin) ListConsumerGroups() (map[string]string, error) {
 	return nil, nil
 }
@@ -590,4 +787,8 @@ func (m *MockClusterAdmin) RemoveMemberFromConsumerGroup(_ string, _ []string) (
 
 func (m *MockClusterAdmin) Close() error {
 	return nil
+}
+
+func (m *MockClusterAdmin) Coordinator(group string) (*sarama.Broker, error) {
+	return nil, nil
 }

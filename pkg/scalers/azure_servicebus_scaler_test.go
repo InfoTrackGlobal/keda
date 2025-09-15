@@ -22,10 +22,10 @@ import (
 	"os"
 	"testing"
 
-	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const (
@@ -49,7 +49,7 @@ type parseServiceBusMetadataTestData struct {
 
 type azServiceBusMetricIdentifier struct {
 	metadataTestData *parseServiceBusMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -95,10 +95,6 @@ var parseServiceBusMetadataDataset = []parseServiceBusMetadataTestData{
 	{map[string]string{"queueName": queueName}, true, queue, "", map[string]string{}, ""},
 	// connection set in auth params
 	{map[string]string{"queueName": queueName}, false, queue, defaultSuffix, map[string]string{"connection": connectionSetting}, ""},
-	// pod identity but missing namespace
-	{map[string]string{"queueName": queueName}, true, queue, "", map[string]string{}, kedav1alpha1.PodIdentityProviderAzure},
-	// correct pod identity
-	{map[string]string{"queueName": queueName, "namespace": namespaceName}, false, queue, defaultSuffix, map[string]string{}, kedav1alpha1.PodIdentityProviderAzure},
 	// workload identity but missing namespace
 	{map[string]string{"queueName": queueName}, true, queue, "", map[string]string{}, kedav1alpha1.PodIdentityProviderAzureWorkload},
 	// correct workload identity
@@ -112,6 +108,7 @@ var parseServiceBusMetadataDataset = []parseServiceBusMetadataTestData{
 	{map[string]string{"queueName": queueName, "connectionFromEnv": connectionSetting, "useRegex": "true", "operation": avgOperation}, false, queue, defaultSuffix, map[string]string{}, ""},
 	{map[string]string{"queueName": queueName, "connectionFromEnv": connectionSetting, "useRegex": "true", "operation": sumOperation}, false, queue, defaultSuffix, map[string]string{}, ""},
 	{map[string]string{"queueName": queueName, "connectionFromEnv": connectionSetting, "useRegex": "true", "operation": maxOperation}, false, queue, defaultSuffix, map[string]string{}, ""},
+	{map[string]string{"queueName": queueName, "connectionFromEnv": connectionSetting, "useRegex": "true"}, false, queue, defaultSuffix, map[string]string{}, ""},
 	{map[string]string{"queueName": queueName, "connectionFromEnv": connectionSetting, "useRegex": "true", "operation": "random"}, true, queue, defaultSuffix, map[string]string{}, ""},
 	// queue with invalid regex string
 	{map[string]string{"queueName": "*", "connectionFromEnv": connectionSetting, "useRegex": "true", "operation": "avg"}, true, queue, defaultSuffix, map[string]string{}, ""},
@@ -136,30 +133,22 @@ var azServiceBusMetricIdentifiers = []azServiceBusMetricIdentifier{
 var getServiceBusLengthTestScalers = []azureServiceBusScaler{
 	{
 		metadata: &azureServiceBusMetadata{
-			entityType: queue,
-			queueName:  queueName,
+			EntityType: queue,
+			QueueName:  queueName,
 		},
 	},
 	{
 		metadata: &azureServiceBusMetadata{
-			entityType:       subscription,
-			topicName:        topicName,
-			subscriptionName: subscriptionName,
+			EntityType:       subscription,
+			TopicName:        topicName,
+			SubscriptionName: subscriptionName,
 		},
 	},
 	{
 		metadata: &azureServiceBusMetadata{
-			entityType:       subscription,
-			topicName:        topicName,
-			subscriptionName: subscriptionName,
-		},
-		podIdentity: kedav1alpha1.AuthPodIdentity{Provider: kedav1alpha1.PodIdentityProviderAzure},
-	},
-	{
-		metadata: &azureServiceBusMetadata{
-			entityType:       subscription,
-			topicName:        topicName,
-			subscriptionName: subscriptionName,
+			EntityType:       subscription,
+			TopicName:        topicName,
+			SubscriptionName: subscriptionName,
 		},
 		podIdentity: kedav1alpha1.AuthPodIdentity{Provider: kedav1alpha1.PodIdentityProviderAzureWorkload},
 	},
@@ -167,10 +156,9 @@ var getServiceBusLengthTestScalers = []azureServiceBusScaler{
 
 func TestParseServiceBusMetadata(t *testing.T) {
 	for index, testData := range parseServiceBusMetadataDataset {
-		meta, err := parseAzureServiceBusMetadata(&ScalerConfig{ResolvedEnv: sampleResolvedEnv,
+		meta, err := parseAzureServiceBusMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: sampleResolvedEnv,
 			TriggerMetadata: testData.metadata, AuthParams: testData.authParams,
-			PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.podIdentity}, ScalerIndex: 0},
-			logr.Discard())
+			PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.podIdentity}, TriggerIndex: 0})
 
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
@@ -180,11 +168,11 @@ func TestParseServiceBusMetadata(t *testing.T) {
 		}
 		fmt.Print(index)
 		if meta != nil {
-			if meta.entityType != testData.entityType {
-				t.Errorf("Expected entity type %v but got %v\n", testData.entityType, meta.entityType)
+			if meta.EntityType != testData.entityType {
+				t.Errorf("Expected entity type %v but got %v\n", testData.entityType, meta.EntityType)
 			}
-			if testData.podIdentity != "" && meta.fullyQualifiedNamespace != testData.fullyQualifiedNamespace {
-				t.Errorf("Expected endpoint suffix %v but got %v\n", testData.fullyQualifiedNamespace, meta.fullyQualifiedNamespace)
+			if testData.podIdentity != "" && meta.FullyQualifiedNamespace != testData.fullyQualifiedNamespace {
+				t.Errorf("Expected endpoint suffix %v but got %v\n", testData.fullyQualifiedNamespace, meta.FullyQualifiedNamespace)
 			}
 		}
 	}
@@ -192,10 +180,9 @@ func TestParseServiceBusMetadata(t *testing.T) {
 
 func TestGetServiceBusAdminClientIsCached(t *testing.T) {
 	testData := azServiceBusMetricIdentifiers[0]
-	meta, err := parseAzureServiceBusMetadata(&ScalerConfig{ResolvedEnv: connectionResolvedEnv,
+	meta, err := parseAzureServiceBusMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: connectionResolvedEnv,
 		TriggerMetadata: testData.metadataTestData.metadata, AuthParams: testData.metadataTestData.authParams,
-		PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, ScalerIndex: testData.scalerIndex},
-		logr.Discard())
+		PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, TriggerIndex: testData.triggerIndex})
 	if err != nil {
 		t.Fatal("Could not parse metadata:", err)
 	}
@@ -219,7 +206,7 @@ func TestGetServiceBusLength(t *testing.T) {
 	for _, scaler := range getServiceBusLengthTestScalers {
 		if connectionString != "" {
 			// Can actually test that numbers return
-			scaler.metadata.connection = connectionString
+			scaler.metadata.Connection = connectionString
 			length, err := scaler.getAzureServiceBusLength(context.TODO())
 
 			if err != nil {
@@ -242,10 +229,9 @@ func TestGetServiceBusLength(t *testing.T) {
 
 func TestAzServiceBusGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range azServiceBusMetricIdentifiers {
-		meta, err := parseAzureServiceBusMetadata(&ScalerConfig{ResolvedEnv: connectionResolvedEnv,
+		meta, err := parseAzureServiceBusMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: connectionResolvedEnv,
 			TriggerMetadata: testData.metadataTestData.metadata, AuthParams: testData.metadataTestData.authParams,
-			PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, ScalerIndex: testData.scalerIndex},
-			logr.Discard())
+			PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}

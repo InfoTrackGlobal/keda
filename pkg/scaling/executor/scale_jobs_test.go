@@ -22,12 +22,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -78,13 +81,17 @@ func TestNewNewScalingStrategy(t *testing.T) {
 	assert.Equal(t, "executor.defaultScalingStrategy", fmt.Sprintf("%T", strategy))
 }
 
+func maxScaleValue(maxValue, _ int64) int64 {
+	return maxValue
+}
+
 func TestDefaultScalingStrategy(t *testing.T) {
 	logger := logf.Log.WithName("ScaledJobTest")
 	strategy := NewScalingStrategy(logger, getMockScaledJobWithDefaultStrategy("default"))
 	// maxScale doesn't exceed MaxReplicaCount. You can ignore on this sceanrio
 	// pendingJobCount isn't relevant on this scenario
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(2), strategy.GetEffectiveMaxScale(2, 0, 0, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(2), maxScaleValue(strategy.GetEffectiveMaxScale(2, 0, 0, 5, 1)))
 }
 
 func TestCustomScalingStrategy(t *testing.T) {
@@ -94,13 +101,13 @@ func TestCustomScalingStrategy(t *testing.T) {
 	strategy := NewScalingStrategy(logger, getMockScaledJobWithStrategy("custom", "custom", customScalingQueueLengthDeduction, customScalingRunningJobPercentage))
 	// maxScale doesn't exceed MaxReplicaCount. You can ignore on this sceanrio
 	// pendingJobCount isn't relevant on this scenario
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(9), strategy.GetEffectiveMaxScale(10, 0, 0, 10))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(9), maxScaleValue(strategy.GetEffectiveMaxScale(10, 0, 0, 10, 1)))
 	strategy = NewScalingStrategy(logger, getMockScaledJobWithCustomStrategyWithNilParameter("custom", "custom"))
 
 	// If you don't set the two parameters is the same behavior as DefaultStrategy
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(2), strategy.GetEffectiveMaxScale(2, 0, 0, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(2), maxScaleValue(strategy.GetEffectiveMaxScale(2, 0, 0, 5, 1)))
 
 	// Empty String will be DefaultStrategy
 	customScalingQueueLengthDeduction = int32(1)
@@ -112,25 +119,48 @@ func TestCustomScalingStrategy(t *testing.T) {
 	customScalingQueueLengthDeduction = int32(2)
 	customScalingRunningJobPercentage = "0"
 	strategy = NewScalingStrategy(logger, getMockScaledJobWithStrategy("custom", "custom", customScalingQueueLengthDeduction, customScalingRunningJobPercentage))
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
 
 	// Exceed the MaxReplicaCount
 	customScalingQueueLengthDeduction = int32(-2)
 	customScalingRunningJobPercentage = "0"
 	strategy = NewScalingStrategy(logger, getMockScaledJobWithStrategy("custom", "custom", customScalingQueueLengthDeduction, customScalingRunningJobPercentage))
-	assert.Equal(t, int64(4), strategy.GetEffectiveMaxScale(3, 2, 0, 4))
+	assert.Equal(t, int64(4), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 4, 1)))
 }
 
 func TestAccurateScalingStrategy(t *testing.T) {
 	logger := logf.Log.WithName("ScaledJobTest")
 	strategy := NewScalingStrategy(logger, getMockScaledJobWithStrategy("accurate", "accurate", 0, "0"))
 	// maxScale doesn't exceed MaxReplicaCount. You can ignore on this sceanrio
-	assert.Equal(t, int64(3), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(3), strategy.GetEffectiveMaxScale(5, 2, 0, 5))
+	assert.Equal(t, int64(3), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(3), maxScaleValue(strategy.GetEffectiveMaxScale(5, 2, 0, 5, 1)))
 
 	// Test with 2 pending jobs
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 4, 2, 10))
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(5, 4, 2, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 4, 2, 10, 1)))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(5, 4, 2, 5, 1)))
+}
+
+func TestEagerScalingStrategy(t *testing.T) {
+	logger := logf.Log.WithName("ScaledJobTest")
+	strategy := NewScalingStrategy(logger, getMockScaledJobWithStrategy("eager", "eager", 0, "0"))
+
+	maxScale, scaleTo := strategy.GetEffectiveMaxScale(4, 3, 0, 10, 1)
+	assert.Equal(t, int64(4), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(4, 0, 3, 10, 1)
+	assert.Equal(t, int64(4), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(4, 7, 0, 10, 1)
+	assert.Equal(t, int64(3), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(4, 1, 6, 10, 1)
+	assert.Equal(t, int64(3), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(15, 0, 0, 10, 1)
+	assert.Equal(t, int64(10), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
 }
 
 func TestCleanUpMixedCaseWithSortByTime(t *testing.T) {
@@ -272,17 +302,167 @@ func TestGetPendingJobCount(t *testing.T) {
 		{PendingPodConditions: pendingPodConditions, PodStatus: v1.PodStatus{Conditions: []v1.PodCondition{readyCondition}}, PendingJobCount: 1},
 		{PendingPodConditions: pendingPodConditions, PodStatus: v1.PodStatus{Conditions: []v1.PodCondition{podScheduledCondition}}, PendingJobCount: 1},
 		{PendingPodConditions: pendingPodConditions, PodStatus: v1.PodStatus{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}}, PendingJobCount: 0},
+
+		// Test case: Job with 2 pods, both have all conditions - should NOT be pending
+		{
+			PendingPodConditions: pendingPodConditions,
+			PodStatuses: []v1.PodStatus{
+				{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}},
+				{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}},
+			},
+			PendingJobCount: 0,
+		},
+
+		// Test case: Job with 2 pods, 1 has all conditions, 1 doesn't - should NOT be pending
+		{
+			PendingPodConditions: pendingPodConditions,
+			PodStatuses: []v1.PodStatus{
+				{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}},
+				{Conditions: []v1.PodCondition{readyCondition}}, // missing PodScheduled
+			},
+			PendingJobCount: 0,
+		},
+
+		// Test case: Job with 2 pods, neither has all conditions - should be pending
+		{
+			PendingPodConditions: pendingPodConditions,
+			PodStatuses: []v1.PodStatus{
+				{Conditions: []v1.PodCondition{readyCondition}},        // missing PodScheduled
+				{Conditions: []v1.PodCondition{podScheduledCondition}}, // missing Ready
+			},
+			PendingJobCount: 1,
+		},
+
+		// Test case: Job with 3 pods, 1 has all conditions - should NOT be pending
+		{
+			PendingPodConditions: pendingPodConditions,
+			PodStatuses: []v1.PodStatus{
+				{Conditions: []v1.PodCondition{}},                                      // no conditions
+				{Conditions: []v1.PodCondition{readyCondition}},                        // partial conditions
+				{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}}, // all conditions
+			},
+			PendingJobCount: 0,
+		},
+
+		// Test case: Job with 3 pods, none have all conditions - should be pending
+		{
+			PendingPodConditions: pendingPodConditions,
+			PodStatuses: []v1.PodStatus{
+				{Conditions: []v1.PodCondition{}},                      // no conditions
+				{Conditions: []v1.PodCondition{readyCondition}},        // partial conditions
+				{Conditions: []v1.PodCondition{podScheduledCondition}}, // partial conditions
+			},
+			PendingJobCount: 1,
+		},
+		// Edge case: Empty conditions list
+		{
+			PendingPodConditions: []string{},
+			PodStatuses: []v1.PodStatus{
+				{Phase: v1.PodRunning, Conditions: []v1.PodCondition{readyCondition}},
+			},
+			PendingJobCount: 0, // No conditions to check, pod is running, so not pending
+		},
 	}
 
-	for _, testData := range testPendingJobTestData {
+	for i, testData := range testPendingJobTestData {
 		ctx := context.Background()
-		client := getMockClientForTestingPendingPods(t, ctrl, testData.PodStatus)
-		scaleExecutor := getMockScaleExecutor(client)
 
+		// Support both single pod and multiple pods test cases
+		var client *mock_client.MockClient
+		if len(testData.PodStatuses) > 0 {
+			client = getMockClientForTestingPendingPodsMultiple(t, ctrl, testData.PodStatuses)
+		} else {
+			client = getMockClientForTestingPendingPods(t, ctrl, testData.PodStatus)
+		}
+
+		scaleExecutor := getMockScaleExecutor(client)
 		scaledJob := getMockScaledJobWithPendingPodConditions(testData.PendingPodConditions)
 		result := scaleExecutor.getPendingJobCount(ctx, scaledJob)
 
-		assert.Equal(t, testData.PendingJobCount, result)
+		assert.Equal(t, testData.PendingJobCount, result, "Test case %d failed", i)
+	}
+}
+
+// Test to check issue #6727
+func TestAreAllPendingPodConditionsFulfilledBugScenario(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pendingPodConditions := []string{"Ready", "PodScheduled"}
+	readyCondition := getPodCondition(v1.PodReady)
+	podScheduledCondition := getPodCondition(v1.PodScheduled)
+
+	podStatuses := []v1.PodStatus{
+		{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}},
+		{Conditions: []v1.PodCondition{readyCondition, podScheduledCondition}},
+	}
+
+	ctx := context.Background()
+	client := getMockClientForTestingPendingPodsMultiple(t, ctrl, podStatuses)
+	scaleExecutor := getMockScaleExecutor(client)
+	scaledJob := getMockScaledJobWithPendingPodConditions(pendingPodConditions)
+
+	result := scaleExecutor.getPendingJobCount(ctx, scaledJob)
+
+	// Should be 0, because both pods have all required conditions
+	assert.Equal(t, int64(0), result, "Job with pods having all conditions should not be pending")
+}
+
+func TestCreateJobs(t *testing.T) {
+	ctx := context.Background()
+	logger := logf.Log.WithName("CreateJobsTest")
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	client := mock_client.NewMockClient(ctrl)
+	scaleExecutor := getMockScaleExecutor(client)
+
+	client.EXPECT().
+		Create(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(_ context.Context, obj runtime.Object, _ ...runtimeclient.CreateOption) {
+		j, ok := obj.(*batchv1.Job)
+		if !ok {
+			t.Error("Cast failed on batchv1.Job at mocking client.Create()")
+		}
+		if ok {
+			assert.Equal(t, "test-", j.ObjectMeta.GenerateName)
+			assert.Equal(t, "test", j.ObjectMeta.Namespace)
+		}
+	}).Times(2).
+		Return(nil)
+
+	scaledJob := getMockScaledJobWithDefaultStrategyAndMeta("test")
+	scaleExecutor.createJobs(ctx, logger, scaledJob, 2, 2)
+}
+
+func TestGenerateJobs(t *testing.T) {
+	var (
+		expectedAnnotations = map[string]string{
+			"test":                         "test",
+			"scaledjob.keda.sh/generation": "0",
+		}
+		expectedLabels = map[string]string{
+			"app.kubernetes.io/managed-by": "keda-operator",
+			"app.kubernetes.io/name":       "test",
+			"app.kubernetes.io/part-of":    "test",
+			"app.kubernetes.io/version":    "main",
+			"scaledjob.keda.sh/name":       "test",
+			"test":                         "test",
+		}
+	)
+
+	logger := logf.Log.WithName("GenerateJobsTest")
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	client := mock_client.NewMockClient(ctrl)
+	scaleExecutor := getMockScaleExecutor(client)
+	scaledJob := getMockScaledJobWithDefaultStrategyAndMeta("test")
+
+	jobs := scaleExecutor.generateJobs(logger, scaledJob, 2)
+
+	assert.Equal(t, 2, len(jobs))
+	for _, j := range jobs {
+		assert.Equal(t, expectedAnnotations, j.ObjectMeta.Annotations)
+		assert.Equal(t, expectedLabels, j.ObjectMeta.Labels)
+		assert.Equal(t, v1.RestartPolicyOnFailure, j.Spec.Template.Spec.RestartPolicy)
 	}
 }
 
@@ -294,16 +474,21 @@ type mockJobParameter struct {
 
 type pendingJobTestData struct {
 	PendingPodConditions []string
-	PodStatus            v1.PodStatus
+	PodStatus            v1.PodStatus   // For single pod tests
+	PodStatuses          []v1.PodStatus // For multiple pods tests
 	PendingJobCount      int64
 }
 
 func getMockScaleExecutor(client *mock_client.MockClient) *scaleExecutor {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(kedav1alpha1.AddToScheme(scheme))
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	return &scaleExecutor{
 		client:           client,
 		scaleClient:      nil,
-		reconcilerScheme: nil,
+		reconcilerScheme: scheme,
 		logger:           logf.Log.WithName("scaleexecutor"),
+		recorder:         record.NewFakeRecorder(1),
 	}
 }
 
@@ -367,10 +552,20 @@ func getMockScaledJobWithCustomStrategyWithNilParameter(name, scalingStrategy st
 
 func getMockScaledJobWithDefaultStrategy(name string) *kedav1alpha1.ScaledJob {
 	scaledJob := &kedav1alpha1.ScaledJob{
-		Spec: kedav1alpha1.ScaledJobSpec{},
+		Spec: kedav1alpha1.ScaledJobSpec{
+			JobTargetRef: &batchv1.JobSpec{},
+		},
 	}
 	scaledJob.ObjectMeta.Name = name
 	return scaledJob
+}
+
+func getMockScaledJobWithDefaultStrategyAndMeta(name string) *kedav1alpha1.ScaledJob {
+	sc := getMockScaledJobWithDefaultStrategy(name)
+	sc.ObjectMeta.Namespace = "test"
+	sc.ObjectMeta.Labels = map[string]string{"test": "test"}
+	sc.ObjectMeta.Annotations = map[string]string{"test": "test"}
+	return sc
 }
 
 func getMockScaledJobWithPendingPodConditions(pendingPodConditions []string) *kedav1alpha1.ScaledJob {
@@ -442,6 +637,45 @@ func getMockClientForTestingPendingPods(t *testing.T, ctrl *gomock.Controller, p
 
 			if ok {
 				p.Items = append(p.Items, v1.Pod{Status: podStatus})
+			}
+		}).
+			Return(nil),
+	)
+
+	return client
+}
+
+// getMockClientForTestingPendingPodsMultiple returns mock client function for testing pending pod conditions with multiple pods in a job
+func getMockClientForTestingPendingPodsMultiple(t *testing.T, ctrl *gomock.Controller, podStatuses []v1.PodStatus) *mock_client.MockClient {
+	client := mock_client.NewMockClient(ctrl)
+	gomock.InOrder(
+		// listing jobs
+		client.EXPECT().
+			List(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(_ context.Context, list runtime.Object, _ ...runtimeclient.ListOption) {
+			j, ok := list.(*batchv1.JobList)
+
+			if !ok {
+				t.Error("Cast failed on batchv1.JobList at mocking client.List()")
+			}
+
+			if ok {
+				j.Items = append(j.Items, batchv1.Job{})
+			}
+		}).
+			Return(nil),
+		// listing pods - multiple pods this time
+		client.EXPECT().
+			List(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(_ context.Context, list runtime.Object, _ ...runtimeclient.ListOption) {
+			p, ok := list.(*v1.PodList)
+
+			if !ok {
+				t.Error("Cast failed on v1.PodList at mocking client.List()")
+			}
+
+			if ok {
+				for _, podStatus := range podStatuses {
+					p.Items = append(p.Items, v1.Pod{Status: podStatus})
+				}
 			}
 		}).
 			Return(nil),

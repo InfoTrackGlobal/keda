@@ -8,13 +8,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -35,16 +35,19 @@ type natsJetStreamScaler struct {
 }
 
 type natsJetStreamMetadata struct {
-	account                string
-	stream                 string
-	consumer               string
-	consumerLeader         string
+	Account                string `keda:"name=account, order=authParams;triggerMetadata, optional"`
+	AccountID              string `keda:"name=accountID, order=authParams;triggerMetadata, optional"`
+	Stream                 string `keda:"name=stream, order=triggerMetadata"`
+	Consumer               string `keda:"name=consumer, order=triggerMetadata"`
+	LagThreshold           int64  `keda:"name=lagThreshold, order=triggerMetadata, default=10"`
+	ActivationLagThreshold int64  `keda:"name=activationLagThreshold, order=triggerMetadata, default=0"`
+	UseHTTPS               bool   `keda:"name=useHttps, optional, order=triggerMetadata, default=false"`
+	NatsServerEndpoint     string `keda:"name=natsServerMonitoringEndpoint, order=authParams;triggerMetadata"`
 	monitoringURL          string
+	consumerLeader         string
 	monitoringLeaderURL    string
-	lagThreshold           int64
-	activationLagThreshold int64
 	clusterSize            int
-	scalerIndex            int
+	triggerIndex           int
 }
 
 type jetStreamEndpointResponse struct {
@@ -63,6 +66,7 @@ type jetStreamCluster struct {
 }
 
 type accountDetail struct {
+	ID      string          `json:"id"`
 	Name    string          `json:"name"`
 	Streams []*streamDetail `json:"stream_detail"`
 }
@@ -112,7 +116,7 @@ type consumerDeliveryStatus struct {
 	StreamSequence   int64 `json:"stream_seq"`
 }
 
-func NewNATSJetStreamScaler(config *ScalerConfig) (Scaler, error) {
+func NewNATSJetStreamScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -132,60 +136,22 @@ func NewNATSJetStreamScaler(config *ScalerConfig) (Scaler, error) {
 	}, nil
 }
 
-func parseNATSJetStreamMetadata(config *ScalerConfig) (natsJetStreamMetadata, error) {
+func parseNATSJetStreamMetadata(config *scalersconfig.ScalerConfig) (natsJetStreamMetadata, error) {
 	meta := natsJetStreamMetadata{}
-
-	account, err := GetFromAuthOrMeta(config, "account")
-	if err != nil {
-		return meta, err
-	}
-	meta.account = account
-
-	if config.TriggerMetadata["stream"] == "" {
-		return meta, errors.New("no stream name given")
-	}
-	meta.stream = config.TriggerMetadata["stream"]
-
-	if config.TriggerMetadata["consumer"] == "" {
-		return meta, errors.New("no consumer name given")
-	}
-	meta.consumer = config.TriggerMetadata["consumer"]
-
-	meta.lagThreshold = defaultJetStreamLagThreshold
-
-	if val, ok := config.TriggerMetadata[jetStreamLagThresholdMetricName]; ok {
-		t, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return meta, fmt.Errorf("error parsing %s: %w", jetStreamLagThresholdMetricName, err)
-		}
-
-		meta.lagThreshold = t
+	if err := config.TypedConfig(&meta); err != nil {
+		return natsJetStreamMetadata{}, fmt.Errorf("error parsing nats metadata: %w", err)
 	}
 
-	meta.activationLagThreshold = 0
-	if val, ok := config.TriggerMetadata["activationLagThreshold"]; ok {
-		activationTargetQueryValue, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return meta, fmt.Errorf("activationLagThreshold parsing error %w", err)
-		}
-		meta.activationLagThreshold = activationTargetQueryValue
+	if meta.Account == `` && meta.AccountID == `` {
+		return natsJetStreamMetadata{}, fmt.Errorf(`no account name or id given`)
 	}
 
-	meta.scalerIndex = config.ScalerIndex
-
-	natsServerEndpoint, err := GetFromAuthOrMeta(config, "natsServerMonitoringEndpoint")
-	if err != nil {
-		return meta, err
+	if meta.AccountID == `` {
+		meta.AccountID = meta.Account
 	}
-	useHTTPS := false
-	if val, ok := config.TriggerMetadata["useHttps"]; ok {
-		useHTTPS, err = strconv.ParseBool(val)
-		if err != nil {
-			return meta, fmt.Errorf("useHTTPS parsing error %w", err)
-		}
-	}
-	meta.monitoringURL = getNATSJetStreamMonitoringURL(useHTTPS, natsServerEndpoint, meta.account)
 
+	meta.triggerIndex = config.TriggerIndex
+	meta.monitoringURL = getNATSJetStreamMonitoringURL(meta.UseHTTPS, meta.NatsServerEndpoint, meta.AccountID)
 	return meta, nil
 }
 
@@ -217,20 +183,6 @@ func (s *natsJetStreamScaler) getNATSJetstreamMonitoringData(ctx context.Context
 	}
 
 	if s.metadata.clusterSize > 1 {
-		// we know who the consumer leader and its monitoring url is, query it directly
-		if s.metadata.consumerLeader != "" && s.metadata.monitoringLeaderURL != "" {
-			natsJetStreamMonitoringLeaderURL := s.metadata.monitoringLeaderURL
-
-			jetStreamAccountResp, err = s.getNATSJetstreamMonitoringRequest(ctx, natsJetStreamMonitoringLeaderURL)
-			if err != nil {
-				return err
-			}
-
-			s.setNATSJetStreamMonitoringData(jetStreamAccountResp, natsJetStreamMonitoringLeaderURL)
-			return nil
-		}
-
-		// we haven't found the consumer yet, grab the list of hosts and try each one
 		natsJetStreamMonitoringServerURL, err := s.getNATSJetStreamMonitoringServerURL("")
 		if err != nil {
 			return err
@@ -245,10 +197,7 @@ func (s *natsJetStreamScaler) getNATSJetstreamMonitoringData(ctx context.Context
 		clusterUrls := jetStreamServerResp.ConnectUrls
 		if len(clusterUrls) == 0 {
 			isNodeAdvertised = false
-			// append current node's `server_name` to check if it is a leader
-			// even though `server_name` is not an url, it will be split by first . (dot)
-			// to get the node's name anyway
-			clusterUrls = append(clusterUrls, jetStreamServerResp.ServerName)
+			// jetStreamServerResp.Cluster.HostUrls contains all the cluster nodes
 			clusterUrls = append(clusterUrls, jetStreamServerResp.Cluster.HostUrls...)
 		}
 
@@ -294,11 +243,11 @@ func (s *natsJetStreamScaler) getNATSJetstreamMonitoringData(ctx context.Context
 			}
 
 			for _, jetStreamAccount := range jetStreamAccountResp.Accounts {
-				if jetStreamAccount.Name == s.metadata.account {
+				if s.metadata.IsAccount(jetStreamAccount) {
 					for _, stream := range jetStreamAccount.Streams {
-						if stream.Name == s.metadata.stream {
+						if stream.Name == s.metadata.Stream {
 							for _, consumer := range stream.Consumers {
-								if consumer.Name == s.metadata.consumer {
+								if consumer.Name == s.metadata.Consumer {
 									// this node is the consumer leader
 									if node == consumer.Cluster.Leader {
 										s.setNATSJetStreamMonitoringData(jetStreamAccountResp, natsJetStreamMonitoringNodeURL)
@@ -311,6 +260,7 @@ func (s *natsJetStreamScaler) getNATSJetstreamMonitoringData(ctx context.Context
 				}
 			}
 		}
+		return fmt.Errorf("leader node not found for consumer %s", s.metadata.Consumer)
 	}
 	return nil
 }
@@ -320,13 +270,13 @@ func (s *natsJetStreamScaler) setNATSJetStreamMonitoringData(jetStreamAccountRes
 
 	// find and assign the stream that we are looking for.
 	for _, jsAccount := range jetStreamAccountResp.Accounts {
-		if jsAccount.Name == s.metadata.account {
+		if s.metadata.IsAccount(jsAccount) {
 			for _, stream := range jsAccount.Streams {
-				if stream.Name == s.metadata.stream {
+				if stream.Name == s.metadata.Stream {
 					s.stream = stream
 
 					for _, consumer := range stream.Consumers {
-						if consumer.Name == s.metadata.consumer {
+						if consumer.Name == s.metadata.Consumer {
 							s.metadata.consumerLeader = consumer.Cluster.Leader
 							if leaderURL != "" {
 								s.metadata.monitoringLeaderURL = leaderURL
@@ -390,12 +340,12 @@ func (s *natsJetStreamScaler) getNATSJetstreamMonitoringRequest(ctx context.Cont
 	return jsAccountResp, nil
 }
 
-func getNATSJetStreamMonitoringURL(useHTTPS bool, natsServerEndpoint string, account string) string {
+func getNATSJetStreamMonitoringURL(useHTTPS bool, natsServerEndpoint string, id string) string {
 	scheme := natsHTTPProtocol
 	if useHTTPS {
 		scheme = natsHTTPSProtocol
 	}
-	return fmt.Sprintf("%s://%s/jsz?acc=%s&consumers=true&config=true", scheme, natsServerEndpoint, account)
+	return fmt.Sprintf("%s://%s/jsz?acc=%s&consumers=true&config=true", scheme, natsServerEndpoint, id)
 }
 
 func (s *natsJetStreamScaler) getNATSJetStreamMonitoringServerURL(nodeHostname string) (string, error) {
@@ -442,7 +392,7 @@ func (s *natsJetStreamScaler) getNATSJetStreamMonitoringNodeURLByNode(node strin
 }
 
 func (s *natsJetStreamScaler) getMaxMsgLag() int64 {
-	consumerName := s.metadata.consumer
+	consumerName := s.metadata.Consumer
 
 	for _, consumer := range s.stream.Consumers {
 		if consumer.Name == consumerName {
@@ -453,12 +403,12 @@ func (s *natsJetStreamScaler) getMaxMsgLag() int64 {
 }
 
 func (s *natsJetStreamScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
-	metricName := kedautil.NormalizeString(fmt.Sprintf("nats-jetstream-%s", s.metadata.stream))
+	metricName := kedautil.NormalizeString(fmt.Sprintf("nats-jetstream-%s", s.metadata.Stream))
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, metricName),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, metricName),
 		},
-		Target: GetMetricTarget(s.metricType, s.metadata.lagThreshold),
+		Target: GetMetricTarget(s.metricType, s.metadata.LagThreshold),
 	}
 	metricSpec := v2.MetricSpec{
 		External: externalMetric,
@@ -478,13 +428,20 @@ func (s *natsJetStreamScaler) GetMetricsAndActivity(ctx context.Context, metricN
 	}
 
 	totalLag := s.getMaxMsgLag()
-	s.logger.V(1).Info("NATS JetStream Scaler: Providing metrics based on totalLag, threshold", "totalLag", totalLag, "lagThreshold", s.metadata.lagThreshold)
+	s.logger.V(1).Info("NATS JetStream Scaler: Providing metrics based on totalLag, threshold", "totalLag", totalLag, "lagThreshold", s.metadata.LagThreshold)
 
 	metric := GenerateMetricInMili(metricName, float64(totalLag))
 
-	return []external_metrics.ExternalMetricValue{metric}, totalLag > s.metadata.activationLagThreshold, nil
+	return []external_metrics.ExternalMetricValue{metric}, totalLag > s.metadata.ActivationLagThreshold, nil
 }
 
 func (s *natsJetStreamScaler) Close(context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
+}
+
+func (metadata natsJetStreamMetadata) IsAccount(account accountDetail) bool {
+	return account.ID == metadata.AccountID || account.Name == metadata.Account
 }

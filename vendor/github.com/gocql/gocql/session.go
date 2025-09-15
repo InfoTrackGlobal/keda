@@ -1,6 +1,26 @@
-// Copyright (c) 2012 The gocql Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Content before git sha 34fdeebefcbf183ed7f916f931aa0586fdaa1b40
+ * Copyright (c) 2012, The Gocql authors,
+ * provided under the BSD-3-Clause License.
+ * See the NOTICE file distributed with this work for additional information.
+ */
 
 package gocql
 
@@ -87,14 +107,14 @@ type Session struct {
 
 var queryPool = &sync.Pool{
 	New: func() interface{} {
-		return &Query{refCount: 1}
+		return &Query{routingInfo: &queryRoutingInfo{}, refCount: 1}
 	},
 }
 
 func addrsToHosts(addrs []string, defaultPort int, logger StdLogger) ([]*HostInfo, error) {
 	var hosts []*HostInfo
-	for _, hostport := range addrs {
-		resolvedHosts, err := hostInfo(hostport, defaultPort)
+	for _, hostaddr := range addrs {
+		resolvedHosts, err := hostInfo(hostaddr, defaultPort)
 		if err != nil {
 			// Try other hosts if unable to resolve DNS name
 			if _, ok := err.(*net.DNSError); ok {
@@ -630,6 +650,9 @@ func (s *Session) routingKeyInfo(ctx context.Context, stmt string) (*routingKeyI
 		return nil, nil
 	}
 
+	table := info.request.table
+	keyspace := info.request.keyspace
+
 	if len(info.request.pkeyColumns) > 0 {
 		// proto v4 dont need to calculate primary key columns
 		types := make([]TypeInfo, len(info.request.pkeyColumns))
@@ -638,16 +661,15 @@ func (s *Session) routingKeyInfo(ctx context.Context, stmt string) (*routingKeyI
 		}
 
 		routingKeyInfo := &routingKeyInfo{
-			indexes: info.request.pkeyColumns,
-			types:   types,
+			indexes:  info.request.pkeyColumns,
+			types:    types,
+			keyspace: keyspace,
+			table:    table,
 		}
 
 		inflight.value = routingKeyInfo
 		return routingKeyInfo, nil
 	}
-
-	// get the table metadata
-	table := info.request.columns[0].Table
 
 	var keyspaceMetadata *KeyspaceMetadata
 	keyspaceMetadata, inflight.err = s.KeyspaceMetadata(info.request.columns[0].Keyspace)
@@ -672,8 +694,10 @@ func (s *Session) routingKeyInfo(ctx context.Context, stmt string) (*routingKeyI
 
 	size := len(partitionKey)
 	routingKeyInfo := &routingKeyInfo{
-		indexes: make([]int, size),
-		types:   make([]TypeInfo, size),
+		indexes:  make([]int, size),
+		types:    make([]TypeInfo, size),
+		keyspace: keyspace,
+		table:    table,
 	}
 
 	for keyIndex, keyColumn := range partitionKey {
@@ -909,6 +933,18 @@ type Query struct {
 	// used by control conn queries to prevent triggering a write to systems
 	// tables in AWS MCS see
 	skipPrepare bool
+
+	// routingInfo is a pointer because Query can be copied and copyable struct can't hold a mutex.
+	routingInfo *queryRoutingInfo
+}
+
+type queryRoutingInfo struct {
+	// mu protects contents of queryRoutingInfo.
+	mu sync.RWMutex
+
+	keyspace string
+
+	table string
 }
 
 func (q *Query) defaultsFromSession() {
@@ -1104,12 +1140,21 @@ func (q *Query) Keyspace() string {
 	if q.getKeyspace != nil {
 		return q.getKeyspace()
 	}
+	if q.routingInfo.keyspace != "" {
+		return q.routingInfo.keyspace
+	}
+
 	if q.session == nil {
 		return ""
 	}
 	// TODO(chbannis): this should be parsed from the query or we should let
 	// this be set by users.
 	return q.session.cfg.Keyspace
+}
+
+// Table returns name of the table the query will be executed against.
+func (q *Query) Table() string {
+	return q.routingInfo.table
 }
 
 // GetRoutingKey gets the routing key to use for routing this query. If
@@ -1134,6 +1179,12 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 		return nil, err
 	}
 
+	if routingKeyInfo != nil {
+		q.routingInfo.mu.Lock()
+		q.routingInfo.keyspace = routingKeyInfo.keyspace
+		q.routingInfo.table = routingKeyInfo.table
+		q.routingInfo.mu.Unlock()
+	}
 	return createRoutingKey(routingKeyInfo, q.values)
 }
 
@@ -1234,7 +1285,7 @@ func (q *Query) PageState(state []byte) *Query {
 // CAS operations which do not end in Cas.
 //
 // See https://issues.apache.org/jira/browse/CASSANDRA-11099
-// https://github.com/gocql/gocql/issues/612
+// https://github.com/apache/cassandra-gocql-driver/issues/612
 func (q *Query) NoSkipMetadata() *Query {
 	q.disableSkipMetadata = true
 	return q
@@ -1349,7 +1400,7 @@ func (q *Query) Release() {
 
 // reset zeroes out all fields of a query so that it can be safely pooled.
 func (q *Query) reset() {
-	*q = Query{refCount: 1}
+	*q = Query{routingInfo: &queryRoutingInfo{}, refCount: 1}
 }
 
 func (q *Query) incRefCount() {
@@ -1691,6 +1742,9 @@ type Batch struct {
 	cancelBatch           func()
 	keyspace              string
 	metrics               *queryMetrics
+
+	// routingInfo is a pointer because Query can be copied and copyable struct can't hold a mutex.
+	routingInfo *queryRoutingInfo
 }
 
 // NewBatch creates a new batch operation without defaults from the cluster
@@ -1698,9 +1752,10 @@ type Batch struct {
 // Deprecated: use session.NewBatch instead
 func NewBatch(typ BatchType) *Batch {
 	return &Batch{
-		Type:    typ,
-		metrics: &queryMetrics{m: make(map[string]*hostMetrics)},
-		spec:    &NonSpeculativeExecution{},
+		Type:        typ,
+		metrics:     &queryMetrics{m: make(map[string]*hostMetrics)},
+		spec:        &NonSpeculativeExecution{},
+		routingInfo: &queryRoutingInfo{},
 	}
 }
 
@@ -1719,6 +1774,7 @@ func (s *Session) NewBatch(typ BatchType) *Batch {
 		keyspace:         s.cfg.Keyspace,
 		metrics:          &queryMetrics{m: make(map[string]*hostMetrics)},
 		spec:             &NonSpeculativeExecution{},
+		routingInfo:      &queryRoutingInfo{},
 	}
 
 	s.mu.RUnlock()
@@ -1741,6 +1797,11 @@ func (b *Batch) Observer(observer BatchObserver) *Batch {
 
 func (b *Batch) Keyspace() string {
 	return b.keyspace
+}
+
+// Batch has no reasonable eqivalent of Query.Table().
+func (b *Batch) Table() string {
+	return b.routingInfo.table
 }
 
 // Attempts returns the number of attempts made to execute the batch.
@@ -2014,8 +2075,10 @@ type routingKeyInfoLRU struct {
 }
 
 type routingKeyInfo struct {
-	indexes []int
-	types   []TypeInfo
+	indexes  []int
+	types    []TypeInfo
+	keyspace string
+	table    string
 }
 
 func (r *routingKeyInfo) String() string {
@@ -2088,6 +2151,7 @@ func (t *traceWriter) Trace(traceId []byte) {
 		activity  string
 		source    string
 		elapsed   int
+		thread    string
 	)
 
 	t.mu.Lock()
@@ -2096,13 +2160,13 @@ func (t *traceWriter) Trace(traceId []byte) {
 	fmt.Fprintf(t.w, "Tracing session %016x (coordinator: %s, duration: %v):\n",
 		traceId, coordinator, time.Duration(duration)*time.Microsecond)
 
-	iter = t.session.control.query(`SELECT event_id, activity, source, source_elapsed
+	iter = t.session.control.query(`SELECT event_id, activity, source, source_elapsed, thread
 			FROM system_traces.events
 			WHERE session_id = ?`, traceId)
 
-	for iter.Scan(&timestamp, &activity, &source, &elapsed) {
-		fmt.Fprintf(t.w, "%s: %s (source: %s, elapsed: %d)\n",
-			timestamp.Format("2006/01/02 15:04:05.999999"), activity, source, elapsed)
+	for iter.Scan(&timestamp, &activity, &source, &elapsed, &thread) {
+		fmt.Fprintf(t.w, "%s: %s [%s] (source: %s, elapsed: %d)\n",
+			timestamp.Format("2006/01/02 15:04:05.999999"), activity, thread, source, elapsed)
 	}
 
 	if err := iter.Close(); err != nil {
@@ -2219,7 +2283,7 @@ var (
 	ErrUnavailable          = errors.New("unavailable")
 	ErrUnsupported          = errors.New("feature not supported")
 	ErrTooManyStmts         = errors.New("too many statements")
-	ErrUseStmt              = errors.New("use statements aren't supported. Please see https://github.com/gocql/gocql for explanation.")
+	ErrUseStmt              = errors.New("use statements aren't supported. Please see https://github.com/apache/cassandra-gocql-driver for explanation.")
 	ErrSessionClosed        = errors.New("session has been closed")
 	ErrNoConnections        = errors.New("gocql: no hosts available in the pool")
 	ErrNoKeyspace           = errors.New("no keyspace provided")

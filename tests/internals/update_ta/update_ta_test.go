@@ -97,14 +97,9 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginxinc/nginx-unprivileged
+        image: ghcr.io/nginx/nginx-unprivileged:1.26
         ports:
         - containerPort: 80
-        resources:
-          requests:
-            cpu: "200m"
-          limits:
-            cpu: "500m"
 `
 
 	deployment2Template = `
@@ -127,14 +122,9 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginxinc/nginx-unprivileged
+        image: ghcr.io/nginx/nginx-unprivileged:1.26
         ports:
         - containerPort: 80
-        resources:
-          requests:
-            cpu: "200m"
-          limits:
-            cpu: "500m"
 `
 
 	scaledObjectTriggerTemplate = `
@@ -158,10 +148,12 @@ spec:
   maxReplicaCount: {{.MaxReplicas}}
   cooldownPeriod: 1
   triggers:
-  - type: cpu
-    metricType: Utilization
+  - type: metrics-api
     metadata:
-      value: "50"
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
     authenticationRef:
       name: {{.TriggerAuthName}}
       kind: {{.TriggerAuthKind}}
@@ -188,10 +180,12 @@ spec:
   maxReplicaCount: {{.MaxReplicas}}
   cooldownPeriod: 1
   triggers:
-  - type: cpu
-    metricType: Utilization
+  - type: metrics-api
     metadata:
-      value: "50"
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
     authenticationRef:
       name: {{.TriggerAuthName}}
       kind: {{.TriggerAuthKind}}
@@ -222,10 +216,12 @@ spec:
   successfulJobsHistoryLimit: 0
   failedJobsHistoryLimit: 0
   triggers:
-  - type: cpu
+  - type: metrics-api
     metadata:
-      type: Utilization
-      value: "50"
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
     authenticationRef:
       name: {{.TriggerAuthName}}
       kind: {{.TriggerAuthKind}}
@@ -256,10 +252,12 @@ spec:
   successfulJobsHistoryLimit: 0
   failedJobsHistoryLimit: 0
   triggers:
-  - type: cpu
+  - type: metrics-api
     metadata:
-      type: Utilization
-      value: "50"
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
     authenticationRef:
       name: {{.TriggerAuthName}}
       kind: {{.TriggerAuthKind}}
@@ -277,7 +275,7 @@ func TestTriggerAuthenticationGeneral(t *testing.T) {
 	CreateKubernetesResources(t, kc, namespace, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, minReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", minReplicas)
+		"replica count should be %d after 9 minutes", minReplicas)
 
 	testTriggerAuthenticationStatusValue(t, data, triggerAuthKind)
 
@@ -289,7 +287,7 @@ func TestTriggerAuthenticationGeneral(t *testing.T) {
 	CreateKubernetesResources(t, kc, namespace, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, minReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", minReplicas)
+		"replica count should be %d after 9 minutes", minReplicas)
 
 	testTriggerAuthenticationStatusValue(t, data, clusterTriggerAuthKind)
 	DeleteKubernetesResources(t, namespace, data, templates)

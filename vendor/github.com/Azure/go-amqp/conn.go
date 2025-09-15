@@ -52,13 +52,13 @@ type ConnOptions struct {
 	//
 	// Must be 512 or greater.
 	//
-	// Default: 512.
+	// Default: 65536.
 	MaxFrameSize uint32
 
 	// MaxSessions sets the maximum number of channels.
 	// The value must be greater than zero.
 	//
-	// Default: 65535.
+	// Default: 65536.
 	MaxSessions uint16
 
 	// Properties sets an entry in the connection properties map sent to the server.
@@ -111,6 +111,7 @@ func Dial(ctx context.Context, addr string, opts *ConnOptions) (*Conn, error) {
 }
 
 // NewConn establishes a new AMQP client connection over conn.
+// NOTE: [Conn] takes ownership of the provided [net.Conn] and will close it as required.
 // opts: pass nil to accept the default values.
 func NewConn(ctx context.Context, conn net.Conn, opts *ConnOptions) (*Conn, error) {
 	c, err := newConn(conn, opts)
@@ -148,8 +149,9 @@ type Conn struct {
 	containerID  string                  // set explicitly or randomly generated
 
 	// peer settings
-	peerIdleTimeout  time.Duration // maximum period between sending frames
-	peerMaxFrameSize uint32        // maximum frame size peer will accept
+	peerIdleTimeout  time.Duration  // maximum period between sending frames
+	peerMaxFrameSize uint32         // maximum frame size peer will accept
+	peerProperties   map[string]any // properties returned by the peer
 
 	// conn state
 	done    chan struct{} // indicates the connection has terminated
@@ -332,9 +334,22 @@ func (c *Conn) initTLSConfig() {
 // start establishes the connection and begins multiplexing network IO.
 // It is an error to call Start() on a connection that's been closed.
 func (c *Conn) start(ctx context.Context) (err error) {
+	// only start connWriter and connReader if there was no error
+	// NOTE: this MUST be the first defer in this scope so that the
+	//       defer for the interruptor goroutine executes first
+	defer func() {
+		if err == nil {
+			// we can't create the channel bitmap until the connection has been established.
+			// this is because our peer can tell us the max channels they support.
+			c.channels = bitmap.New(uint32(c.channelMax))
+
+			go c.connWriter()
+			go c.connReader()
+		}
+	}()
+
 	// if the context has a deadline or is cancellable, start the interruptor goroutine.
 	// this will close the underlying net.Conn in response to the context.
-
 	if ctx.Done() != nil {
 		done := make(chan struct{})
 		interruptRes := make(chan error, 1)
@@ -359,15 +374,8 @@ func (c *Conn) start(ctx context.Context) (err error) {
 	}
 
 	if err = c.startImpl(ctx); err != nil {
-		return err
+		return
 	}
-
-	// we can't create the channel bitmap until the connection has been established.
-	// this is because our peer can tell us the max channels they support.
-	c.channels = bitmap.New(uint32(c.channelMax))
-
-	go c.connWriter()
-	go c.connReader()
 
 	return
 }
@@ -398,6 +406,13 @@ func (c *Conn) startImpl(ctx context.Context) error {
 }
 
 // Close closes the connection.
+//
+// Returns nil if there were no errors during shutdown,
+// or a *ConnError. This error is not actionable and is
+// purely for diagnostic purposes.
+//
+// The error returned by subsequent calls to Close is
+// idempotent, so the same value will always be returned.
 func (c *Conn) Close() error {
 	c.close()
 
@@ -407,15 +422,32 @@ func (c *Conn) Close() error {
 	<-c.txDone
 	<-c.rxDone
 
-	var connErr *ConnError
-	if errors.As(c.doneErr, &connErr) && connErr.RemoteErr == nil && connErr.inner == nil {
-		// an empty ConnectionError means the connection was closed by the caller
+	return c.closedErr()
+}
+
+// Done returns a channel that's closed when Conn is closed.
+func (c *Conn) Done() <-chan struct{} {
+	return c.done
+}
+
+// If Done is not yet closed, Err returns nil.
+// If Done is closed, Err returns nil or a *ConnError explaining why.
+// A nil error indicates that [Close] was called and there
+// were no errors during shutdown.
+//
+// A *ConnError indicates one of three things
+//   - there was an error during shutdown from a client-side call to [Close]. the
+//     error is not actionable and is purely for diagnostic purposes.
+//   - a fatal error was encountered that caused [Conn] to close
+//   - the peer closed the connection. [ConnError.RemoteErr] MAY contain an error
+//     from the peer indicating why it closed the connection
+func (c *Conn) Err() error {
+	select {
+	case <-c.done:
+		return c.closedErr()
+	default:
 		return nil
 	}
-
-	// there was an error during shut-down or connReader/connWriter
-	// experienced a terminal error
-	return c.doneErr
 }
 
 // close is called once, either from Close() or when connReader/connWriter exits
@@ -463,6 +495,20 @@ func (c *Conn) closeDuringStart() {
 	})
 }
 
+// returns the error indicating why Conn has closed
+// NOTE: only call this AFTER Conn.done has been closed!
+func (c *Conn) closedErr() error {
+	// an empty ConnError means the connection was closed by the caller
+	var connErr *ConnError
+	if errors.As(c.doneErr, &connErr) && connErr.RemoteErr == nil && connErr.inner == nil {
+		return nil
+	}
+
+	// there was an error during shut-down or connReader/connWriter
+	// experienced a terminal error
+	return c.doneErr
+}
+
 // NewSession starts a new session on the connection.
 //   - ctx controls waiting for the peer to acknowledge the session
 //   - opts contains optional values, pass nil to accept the defaults
@@ -487,6 +533,12 @@ func (c *Conn) NewSession(ctx context.Context, opts *SessionOptions) (*Session, 
 	}
 
 	return session, nil
+}
+
+// Properties returns the peer's connection properties.
+// Returns nil if the peer didn't send any properties.
+func (c *Conn) Properties() map[string]any {
+	return c.peerProperties
 }
 
 func (c *Conn) freeAbandonedSessions(ctx context.Context) error {
@@ -551,7 +603,7 @@ func (c *Conn) connReader() {
 	var err error
 	for {
 		if err != nil {
-			debug.Log(1, "RX (connReader %p): terminal error: %v", c, err)
+			debug.Log(0, "RX (connReader %p): terminal error: %v", c, err)
 			c.rxErr = err
 			return
 		}
@@ -562,7 +614,7 @@ func (c *Conn) connReader() {
 			continue
 		}
 
-		debug.Log(1, "RX (connReader %p): %s", c, fr)
+		debug.Log(0, "RX (connReader %p): %s", c, fr)
 
 		var (
 			session *Session
@@ -662,13 +714,15 @@ func (c *Conn) readFrame() (frames.Frame, error) {
 			}
 		}
 
-		// read more if buf doesn't contain enough to parse the header
-		if c.rxBuf.Len() < frames.HeaderSize {
-			continue
-		}
-
 		// parse the header if a frame isn't in progress
 		if !frameInProgress {
+			// read more if buf doesn't contain enough to parse the header
+			// NOTE: we MUST do this ONLY if a frame isn't in progress else we can
+			// end up stalling when reading frames with bodies smaller than HeaderSize
+			if c.rxBuf.Len() < frames.HeaderSize {
+				continue
+			}
+
 			var err error
 			currentHeader, err = frames.ParseHeader(&c.rxBuf)
 			if err != nil {
@@ -711,14 +765,26 @@ func (c *Conn) readFrame() (frames.Frame, error) {
 	}
 }
 
+// frameContext is an extended context.Context used to track writes to the network.
+// this is required in order to remove ambiguities that can arise when simply waiting
+// on context.Context.Done() to be signaled.
+type frameContext struct {
+	// Ctx contains the caller's context and is used to set the write deadline.
+	Ctx context.Context
+
+	// Done is closed when the frame was successfully written to net.Conn or Ctx was cancelled/timed out.
+	// Can be nil, but shouldn't be for callers that care about confirmation of sending.
+	Done chan struct{}
+
+	// Err contains the context error.  MUST be set before closing Done and ONLY read if Done is closed.
+	// ONLY Conn.connWriter may write to this field.
+	Err error
+}
+
 // frameEnvelope is used when sending a frame to connWriter to be written to net.Conn
 type frameEnvelope struct {
-	Ctx   context.Context
-	Frame frames.Frame
-
-	// optional channel that is closed on successful write to net.Conn or contains the write error
-	// NOTE: use a buffered channel of size 1 when populating
-	Sent chan error
+	FrameCtx *frameContext
+	Frame    frames.Frame
 }
 
 func (c *Conn) connWriter() {
@@ -745,7 +811,7 @@ func (c *Conn) connWriter() {
 	var err error
 	for {
 		if err != nil {
-			debug.Log(1, "TX (connWriter %p): terminal error: %v", c, err)
+			debug.Log(0, "TX (connWriter %p): terminal error: %v", c, err)
 			c.txErr = err
 			return
 		}
@@ -753,24 +819,24 @@ func (c *Conn) connWriter() {
 		select {
 		// frame write request
 		case env := <-c.txFrame:
-			timeout, ctxErr := c.getWriteTimeout(env.Ctx)
+			timeout, ctxErr := c.getWriteTimeout(env.FrameCtx.Ctx)
 			if ctxErr != nil {
-				debug.Log(1, "TX (connWriter %p) deadline exceeded: %s", c, env.Frame)
-				if env.Sent != nil {
-					env.Sent <- ctxErr
+				debug.Log(1, "TX (connWriter %p) getWriteTimeout: %s: %s", c, ctxErr.Error(), env.Frame)
+				if env.FrameCtx.Done != nil {
+					// the error MUST be set before closing the channel
+					env.FrameCtx.Err = ctxErr
+					close(env.FrameCtx.Done)
 				}
 				continue
 			}
 
-			debug.Log(1, "TX (connWriter %p) timeout %s: %s", c, timeout, env.Frame)
+			debug.Log(0, "TX (connWriter %p) timeout %s: %s", c, timeout, env.Frame)
 			err = c.writeFrame(timeout, env.Frame)
-			if env.Sent != nil {
-				if err == nil {
-					close(env.Sent)
-				} else {
-					env.Sent <- err
-				}
+			if err == nil && env.FrameCtx.Done != nil {
+				close(env.FrameCtx.Done)
 			}
+			// in the event of write failure, Conn will close and a
+			// *ConnError will be propagated to all of the sessions/link.
 
 		// keepalive timer
 		case <-keepalive:
@@ -851,17 +917,12 @@ func (c *Conn) writeProtoHeader(pID protoID) error {
 var keepaliveFrame = []byte{0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00}
 
 // SendFrame is used by sessions and links to send frames across the network.
-//   - ctx is used to provide the write deadline
-//   - fr is the frame to write to net.Conn
-//   - sent is the optional channel that will contain the error if the write fails
-func (c *Conn) sendFrame(ctx context.Context, fr frames.Frame, sent chan error) {
+func (c *Conn) sendFrame(frameEnv frameEnvelope) {
 	select {
-	case c.txFrame <- frameEnvelope{Ctx: ctx, Frame: fr, Sent: sent}:
-		debug.Log(2, "TX (Conn %p): mux frame to connWriter: %s", c, fr)
+	case c.txFrame <- frameEnv:
+		debug.Log(2, "TX (Conn %p): mux frame to connWriter: %s", c, frameEnv.Frame)
 	case <-c.done:
-		if sent != nil {
-			sent <- c.doneErr
-		}
+		// Conn has closed
 	}
 }
 
@@ -1041,6 +1102,13 @@ func (c *Conn) openAMQP(ctx context.Context) (stateFunc, error) {
 		c.channelMax = o.ChannelMax
 	}
 
+	if len(o.Properties) > 0 {
+		c.peerProperties = map[string]any{}
+		for k, v := range o.Properties {
+			c.peerProperties[string(k)] = v
+		}
+	}
+
 	// connection established, exit state machine
 	return nil, nil
 }
@@ -1114,6 +1182,11 @@ func (c *Conn) readSingleFrame() (frames.Frame, error) {
 // or the default write timeout if the context has no deadline.
 // if the context has timed out or was cancelled, an error is returned.
 func (c *Conn) getWriteTimeout(ctx context.Context) (time.Duration, error) {
+	if ctx.Err() != nil {
+		// if the context is already cancelled we can just bail.
+		return 0, ctx.Err()
+	}
+
 	if deadline, ok := ctx.Deadline(); ok {
 		until := time.Until(deadline)
 		if until <= 0 {

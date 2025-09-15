@@ -20,7 +20,7 @@ go test -v -tags e2e ./utils/cleanup_test.go      # Skip if you want to keep tes
 > As default, `go test -v -tags e2e ./utils/setup_test.go` deploys KEDA from upstream's main branch,
 > if you are adding an e2e test to your own code, this is not useful as you need your own version.
 > Like for [building and deploying your own image](../BUILD.md#custom-keda-as-an-image), you can use
-> the Makefile envrionment variables to customize KEDA deployment.
+> the Makefile environment variables to customize KEDA deployment.
 > eg. `IMAGE_REGISTRY=docker.io IMAGE_REPO=johndoe go test -v -tags e2e ./utils/setup_test.go`
 
 ### Specific test
@@ -192,6 +192,7 @@ func testScaleOut(t *testing.T, kc *kubernetes.Clientset) {
     ...
     ...
     // Sleep / poll for replica count using helper method.
+    // Duration should be iterations * intervalSeconds
     require.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 10, 60, 1),
 		"replica count should be 10 after 1 minute")
 }

@@ -111,14 +111,9 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginxinc/nginx-unprivileged
+        image: ghcr.io/nginx/nginx-unprivileged:1.26
         ports:
         - containerPort: 80
-        resources:
-          requests:
-            cpu: "200m"
-          limits:
-            cpu: "500m"
 `
 
 	workloadDeploymentTemplate = `apiVersion: apps/v1
@@ -140,7 +135,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: 'nginxinc/nginx-unprivileged'`
+          image: 'ghcr.io/nginx/nginx-unprivileged:1.26'`
 
 	metricsServerDeploymentTemplate = `
 apiVersion: apps/v1
@@ -270,10 +265,12 @@ spec:
     metadata:
       podSelector: 'pod={{.WorkloadDeploymentName}}'
       value: '1'
-  - type: cpu
-    metricType: Utilization
+  - type: metrics-api
     metadata:
-      value: "50"
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
 `
 
 	updateMetricTemplate = `
@@ -304,7 +301,7 @@ func TestScaledObjectGeneral(t *testing.T) {
 	CreateKubernetesResources(t, kc, namespace, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, minReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", minReplicas)
+		"replica count should be %d after 9 minutes", minReplicas)
 
 	testTargetValue(t, kc, data)          // one trigger target changes
 	testTwoTriggers(t, kc, data)          // add trigger during active scaling
@@ -320,24 +317,24 @@ func testTargetValue(t *testing.T, kc *kubernetes.Clientset, data templateData) 
 	KubectlApplyWithTemplate(t, data, "scaledObjectTriggerTemplate", scaledObjectTriggerTemplate)
 
 	data.MetricValue = 1
-	KubectlApplyWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, 1, 180, 3),
-		"replica count should be %d after 3 minutes", 1)
+		"replica count should be %d after 9 minutes", 1)
 
 	t.Log("--- test target value 10 ---")
 	data.MetricValue = 10
-	KubectlApplyWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, maxReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", maxReplicas)
+		"replica count should be %d after 9 minutes", maxReplicas)
 
 	t.Log("--- test target value 0 ---")
 	data.MetricValue = 0
-	KubectlApplyWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, minReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", minReplicas)
+		"replica count should be %d after 9 minutes", minReplicas)
 }
 
 // test adding second trigger during scaling
@@ -346,17 +343,17 @@ func testTwoTriggers(t *testing.T, kc *kubernetes.Clientset, data templateData) 
 	KubectlApplyWithTemplate(t, data, "scaledObjectTriggerTemplate", scaledObjectTriggerTemplate)
 
 	data.MetricValue = 1
-	KubectlApplyWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, 1, 180, 3),
-		"replica count should be %d after 3 minutes", 1)
+		"replica count should be %d after 9 minutes", 1)
 
 	KubectlApplyWithTemplate(t, data, "scaledObjectTwoTriggerTemplate", scaledObjectTwoTriggerTemplate)
 	// scale to max with k8s wl = second trigger
 	KubernetesScaleDeployment(t, kc, workloadDeploymentName, int64(maxReplicas), namespace)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, maxReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", maxReplicas)
+		"replica count should be %d after 9 minutes", maxReplicas)
 }
 
 // scales to max with kubernetes worload(second trigger), removes it and
@@ -365,18 +362,18 @@ func testRemoveTrigger(t *testing.T, kc *kubernetes.Clientset, data templateData
 	t.Log("--- test remove trigger 2 -> 1 ---")
 	KubectlApplyWithTemplate(t, data, "scaledObjectTwoTriggerTemplate", scaledObjectTwoTriggerTemplate)
 	data.MetricValue = 5 // 3 replicas (midReplicas)
-	KubectlApplyWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
 	KubernetesScaleDeployment(t, kc, workloadDeploymentName, int64(maxReplicas), namespace)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, maxReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", maxReplicas)
+		"replica count should be %d after 9 minutes", maxReplicas)
 
 	// update SO -> remove k8s wl == second trigger
 	KubectlApplyWithTemplate(t, data, "scaledObjectTriggerTemplate", scaledObjectTriggerTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, midReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", midReplicas)
+		"replica count should be %d after 9 minutes", midReplicas)
 }
 
 // test 3 triggers scaling works including one cpu metric
@@ -388,9 +385,9 @@ func testThreeTriggersWithCPU(t *testing.T, kc *kubernetes.Clientset, data templ
 
 	// scaling might take longer because of fetching of the cpu metrics (possibly increase iterations if needed)
 	data.MetricValue = 10
-	KubectlApplyWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, namespace, maxReplicas, 180, 3),
-		"replica count should be %d after 3 minutes", maxReplicas)
+		"replica count should be %d after 9 minutes", maxReplicas)
 }
 
 // help function to load template data
