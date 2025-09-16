@@ -136,6 +136,10 @@ type azurePipelinesScaler struct {
 type azurePipelinesMetadata struct {
 	OrganizationURL                      string `keda:"name=organizationURL,          order=resolvedEnv;authParams"`
 	OrganizationName                     string
+	// Custom auth fields for client credentials
+	ClientID                             string `keda:"name=clientID,          order=authParams, optional"`
+	ClientSecret                         string `keda:"name=clientSecret,          order=authParams, optional"`
+	TenantID                             string `keda:"name=tenantID,          order=authParams, optional"`
 	authContext                          authContext
 	Parent                               string `keda:"name=parent,          order=triggerMetadata, optional"`
 	Demands                              string `keda:"name=demands,          order=triggerMetadata, optional"`
@@ -188,8 +192,84 @@ func NewAzurePipelinesScaler(ctx context.Context, config *scalersconfig.ScalerCo
 	}, nil
 }
 
+// Custom function to get access token using client credentials (your addition)
+func getAccessTokenWithClientCredentials(ctx context.Context, clientID string, clientSecret string, tenantID string) (string, error) {
+	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", tenantID)
+
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("resource", "499b84ac-1321-427f-aa17-267ca6975798")
+
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		return "", err
+	}
+
+	return tokenResponse.AccessToken, nil
+}
+
 func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (string, *azidentity.ChainedTokenCredential, kedav1alpha1.AuthPodIdentity, error) {
 	pat := ""
+	
+	// Check for client credentials first (your custom auth method)
+	if clientID, hasClientID := config.AuthParams["clientID"]; hasClientID && clientID != "" {
+		clientSecret := config.AuthParams["clientSecret"]
+		tenantID := config.AuthParams["tenantID"]
+		
+		if clientSecret == "" || tenantID == "" {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("clientID provided but missing clientSecret or tenantID")
+		}
+		
+		// Get token using client credentials
+		token, err := getAccessTokenWithClientCredentials(context.Background(), clientID, clientSecret, tenantID)
+		if err != nil {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("failed to obtain access token with client credentials: %w", err)
+		}
+		
+		return token, nil, kedav1alpha1.AuthPodIdentity{}, nil
+	}
+	
+	// Check for environment-based client credentials
+	if clientIDFromEnv, hasClientIDFromEnv := config.TriggerMetadata["clientIDFromEnv"]; hasClientIDFromEnv && clientIDFromEnv != "" {
+		clientID := config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
+		clientSecret := config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
+		tenantID := config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
+		
+		if clientID == "" || clientSecret == "" || tenantID == "" {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("incomplete client credentials from environment")
+		}
+		
+		token, err := getAccessTokenWithClientCredentials(context.Background(), clientID, clientSecret, tenantID)
+		if err != nil {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("failed to obtain access token with client credentials: %w", err)
+		}
+		
+		return token, nil, kedav1alpha1.AuthPodIdentity{}, nil
+	}
+	
+	// Check for PAT
 	if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
 		// Found the personalAccessToken in a parameter from TriggerAuthentication
 		pat = config.AuthParams["personalAccessToken"]
@@ -326,8 +406,8 @@ func getAzurePipelineRequest(ctx context.Context, logger logr.Logger, urlString 
 
 	switch podIdentity.Provider {
 	case "", kedav1alpha1.PodIdentityProviderNone:
-		//PAT
-		logger.V(1).Info("making request to ADO REST API using PAT")
+		//PAT or client credentials token
+		logger.V(1).Info("making request to ADO REST API using PAT or client credentials")
 		req.SetBasicAuth("", metadata.authContext.pat)
 	case kedav1alpha1.PodIdentityProviderAzureWorkload:
 		//ADO Resource token
