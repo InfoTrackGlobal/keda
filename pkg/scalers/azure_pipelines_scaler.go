@@ -134,6 +134,7 @@ type azurePipelinesScaler struct {
 }
 
 type azurePipelinesMetadata struct {
+
 	OrganizationURL                      string `keda:"name=organizationURL,          order=resolvedEnv;authParams"`
 	OrganizationName                     string
 	// Custom auth fields for client credentials
@@ -192,7 +193,7 @@ func NewAzurePipelinesScaler(ctx context.Context, config *scalersconfig.ScalerCo
 	}, nil
 }
 
-// Custom function to get access token using client credentials (your addition)
+// Custom function to get access token using client credentials
 func getAccessTokenWithClientCredentials(ctx context.Context, clientID string, clientSecret string, tenantID string) (string, error) {
 	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", tenantID)
 
