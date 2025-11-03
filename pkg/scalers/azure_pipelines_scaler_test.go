@@ -197,7 +197,7 @@ func TestAzurePipelinesGetMetricSpecForScaling(t *testing.T) {
 
 func getMatchedAgentMetaData(url string) *azurePipelinesMetadata {
 	meta := azurePipelinesMetadata{}
-	meta.OrganizationName = "testOrg"
+	meta.organizationName = "testOrg"
 	meta.OrganizationURL = url
 	meta.Parent = "dotnet60-keda-template"
 	meta.authContext.pat = "testPAT"
@@ -449,7 +449,7 @@ func TestAzurePipelinesQueueURLTest(t *testing.T) {
 			}))
 
 			meta := testData.metadata
-			meta.OrganizationName = "testOrg"
+			meta.organizationName = "testOrg"
 			meta.OrganizationURL = apiStub.URL
 			meta.authContext.pat = "testPAT"
 			meta.PoolID = 1

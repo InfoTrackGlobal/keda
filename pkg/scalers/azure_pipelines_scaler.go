@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
-	"github.com/kedacore/keda/v2/pkg/scalers/azure"
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
@@ -32,8 +30,8 @@ type JobRequests struct {
 const (
 	// "499b84ac-1321-427f-aa17-267ca6975798" is the azure id for DevOps resource
 	// https://learn.microsoft.com/en-gb/azure/devops/integrate/get-started/authentication/service-principal-managed-identity?view=azure-devops
-	devopsResource                          = "499b84ac-1321-427f-aa17-267ca6975798/.default"
-	defaultTargetPipelinesQueueLength       = 1
+	devopsResource                    = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+	defaultTargetPipelinesQueueLength = 1
 )
 
 type authContext struct {
@@ -255,8 +253,6 @@ func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (stri
 
 	return pat, nil, kedav1alpha1.AuthPodIdentity{}, nil
 }
-
-
 
 func parseAzurePipelinesMetadata(ctx context.Context, logger logr.Logger, config *scalersconfig.ScalerConfig, httpClient *http.Client) (*azurePipelinesMetadata, kedav1alpha1.AuthPodIdentity, error) {
 	if config.TriggerMetadata["jobsToFetch"] != "" && config.TriggerMetadata["fetchUnfinishedJobsOnly"] != "" {
