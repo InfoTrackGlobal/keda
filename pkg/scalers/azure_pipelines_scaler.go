@@ -32,8 +32,15 @@ type JobRequests struct {
 const (
 	// "499b84ac-1321-427f-aa17-267ca6975798" is the azure id for DevOps resource
 	// https://learn.microsoft.com/en-gb/azure/devops/integrate/get-started/authentication/service-principal-managed-identity?view=azure-devops
-	devopsResource = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+	devopsResource                          = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+	defaultTargetPipelinesQueueLength       = 1
 )
+
+type authContext struct {
+	pat   string
+	cred  azcore.TokenCredential
+	token *azcore.AccessToken
+}
 
 type JobRequest struct {
 	RequestID     int       `json:"requestId"`
@@ -135,6 +142,18 @@ type azurePipelinesScaler struct {
 }
 
 type azurePipelinesMetadata struct {
+	OrganizationURL                      string `keda:"name=organizationURL,           order=triggerMetadata, optional"`
+	PoolName                             string `keda:"name=poolName,                   order=triggerMetadata, optional"`
+	PoolID                               int    `keda:"name=poolID,                     order=triggerMetadata, optional"`
+	TargetPipelinesQueueLength           int64  `keda:"name=targetPipelinesQueueLength, order=triggerMetadata, optional, default=1"`
+	ActivationTargetPipelinesQueueLength int64  `keda:"name=activationTargetPipelinesQueueLength, order=triggerMetadata, optional, default=0"`
+	Parent                               string `keda:"name=parent,                     order=triggerMetadata, optional"`
+	Demands                              string `keda:"name=demands,                    order=triggerMetadata, optional"`
+	RequireAllDemands                    bool   `keda:"name=requireAllDemands,          order=triggerMetadata, optional"`
+	RequireAllDemandsAndIgnoreOthers     bool   `keda:"name=requireAllDemandsAndIgnoreOthers, order=triggerMetadata, optional"`
+	JobsToFetch                          int64  `keda:"name=jobsToFetch,                order=triggerMetadata, optional, default=250"`
+	FetchUnfinishedJobsOnly              bool   `keda:"name=fetchUnfinishedJobsOnly,    order=triggerMetadata, optional"`
+
 	organizationURL                      string
 	organizationName                     string
 	clientID                             string
@@ -149,6 +168,8 @@ type azurePipelinesMetadata struct {
 	jobsToFetch                          int64
 	scalerIndex                          int
 	requireAllDemands                    bool
+	triggerIndex                         int
+	authContext                          authContext
 }
 
 // NewAzurePipelinesScaler creates a new AzurePipelinesScaler
@@ -212,123 +233,30 @@ func getAccessTokenWithClientCredentials(ctx context.Context, clientID string, c
 	return tokenResponse.AccessToken, nil
 }
 
-func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, httpClient *http.Client) (*azurePipelinesMetadata, error) {
-	meta := azurePipelinesMetadata{}
-	meta.targetPipelinesQueueLength = defaultTargetPipelinesQueueLength
-
-	if val, ok := config.TriggerMetadata["targetPipelinesQueueLength"]; ok {
-		queueLength, err := strconv.ParseInt(val, 10, 64)
+func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (string, azcore.TokenCredential, kedav1alpha1.AuthPodIdentity, error) {
+	if config.PodIdentity.Provider == kedav1alpha1.PodIdentityProviderAzureWorkload {
+		logger.V(1).Info("using workload identity for authentication")
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing azure pipelines metadata targetPipelinesQueueLength: %w", err)
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("error creating default azure credential: %w", err)
 		}
-
-		meta.targetPipelinesQueueLength = queueLength
+		return "", cred, kedav1alpha1.AuthPodIdentity{Provider: config.PodIdentity.Provider}, nil
 	}
 
-	meta.activationTargetPipelinesQueueLength = 0
-	if val, ok := config.TriggerMetadata["activationTargetPipelinesQueueLength"]; ok {
-		activationQueueLength, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing azure pipelines metadata activationTargetPipelinesQueueLength: %w", err)
-		}
-
-		meta.activationTargetPipelinesQueueLength = activationQueueLength
-	}
-
-	if val, ok := config.AuthParams["organizationURL"]; ok && val != "" {
-		// Found the organizationURL in a parameter from TriggerAuthentication
-		meta.organizationURL = val
-	} else if val, ok := config.TriggerMetadata["organizationURLFromEnv"]; ok && val != "" {
-		meta.organizationURL = config.ResolvedEnv[val]
-	} else {
-		return nil, fmt.Errorf("no organizationURL given")
-	}
-
-	if val := meta.organizationURL[strings.LastIndex(meta.organizationURL, "/")+1:]; val != "" {
-		meta.organizationName = meta.organizationURL[strings.LastIndex(meta.organizationURL, "/")+1:]
-	} else {
-		return nil, fmt.Errorf("failed to extract organization name from organizationURL")
-	}
-
-	if val, ok := config.AuthParams["clientID"]; ok && val != "" {
-		meta.clientID = val
-		meta.clientSecret = config.AuthParams["clientSecret"]
-		meta.tenantID = config.AuthParams["tenantID"]
-	} else if val, ok := config.TriggerMetadata["clientIDFromEnv"]; ok && val != "" {
-		meta.clientID = config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
-		meta.clientSecret = config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
-		meta.tenantID = config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
-	} else if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
-		// Found the personalAccessToken in a parameter from TriggerAuthentication
-		pat = config.AuthParams["personalAccessToken"]
+	// Personal Access Token authentication
+	var pat string
+	if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
+		pat = val
 	} else if val, ok := config.TriggerMetadata["personalAccessTokenFromEnv"]; ok && val != "" {
-		pat = config.ResolvedEnv[config.TriggerMetadata["personalAccessTokenFromEnv"]]
+		pat = config.ResolvedEnv[val]
 	} else {
-		return nil, fmt.Errorf("no valid authentication method provided")
+		return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("no personal access token found")
 	}
 
-	// Check if clientID and clientSecret are provided for authentication
-	if meta.clientID != "" {
-		token, err := getAccessTokenWithClientCredentials(ctx, meta.clientID, meta.clientSecret, meta.tenantID)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to obtain access token: %w\n", err)
-		}
-
-		// Use the token for further requests
-		meta.personalAccessToken = token
-	}
-
-	if val, ok := config.TriggerMetadata["parent"]; ok && val != "" {
-		meta.parent = config.TriggerMetadata["parent"]
-	} else {
-		meta.parent = ""
-	}
-
-	if val, ok := config.TriggerMetadata["demands"]; ok && val != "" {
-		meta.demands = config.TriggerMetadata["demands"]
-	} else {
-		meta.demands = ""
-	}
-
-	meta.jobsToFetch = 250
-	if val, ok := config.TriggerMetadata["jobsToFetch"]; ok && val != "" {
-		jobsToFetch, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing jobsToFetch: %w", err)
-		}
-		meta.jobsToFetch = jobsToFetch
-	}
-
-	meta.requireAllDemands = false
-	if val, ok := config.TriggerMetadata["requireAllDemands"]; ok && val != "" {
-		requireAllDemands, err := strconv.ParseBool(val)
-		if err != nil {
-			return nil, err
-		}
-		meta.requireAllDemands = requireAllDemands
-	}
-
-	if val, ok := config.TriggerMetadata["poolName"]; ok && val != "" {
-		var err error
-		poolID, err := getPoolIDFromName(ctx, val, &meta, httpClient)
-		if err != nil {
-			return nil, err
-		}
-		meta.poolID = poolID
-	} else {
-		if val, ok := config.TriggerMetadata["poolID"]; ok && val != "" {
-			var err error
-			poolID, err := validatePoolID(ctx, val, &meta, httpClient)
-			if err != nil {
-				return "", nil, kedav1alpha1.AuthPodIdentity{}, err
-			}
-			return "", cred, kedav1alpha1.AuthPodIdentity{Provider: config.PodIdentity.Provider}, nil
-		default:
-			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("pod identity %s not supported for azure pipelines", config.PodIdentity.Provider)
-		}
-	}
 	return pat, nil, kedav1alpha1.AuthPodIdentity{}, nil
 }
+
+
 
 func parseAzurePipelinesMetadata(ctx context.Context, logger logr.Logger, config *scalersconfig.ScalerConfig, httpClient *http.Client) (*azurePipelinesMetadata, kedav1alpha1.AuthPodIdentity, error) {
 	if config.TriggerMetadata["jobsToFetch"] != "" && config.TriggerMetadata["fetchUnfinishedJobsOnly"] != "" {
