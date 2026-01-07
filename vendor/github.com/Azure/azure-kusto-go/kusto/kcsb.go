@@ -2,35 +2,40 @@ package kusto
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
 	kustoErrors "github.com/Azure/azure-kusto-go/kusto/data/errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"strconv"
-	"strings"
 )
 
 type ConnectionStringBuilder struct {
-	DataSource                       string
-	AadUserID                        string
-	Password                         string
-	UserToken                        string
-	ApplicationClientId              string
-	ApplicationKey                   string
-	AuthorityId                      string
-	ApplicationCertificate           string
-	ApplicationCertificateThumbprint string
-	SendCertificateChain             bool
-	ApplicationToken                 string
-	AzCli                            bool
-	MsiAuthentication                bool
-	ManagedServiceIdentity           string
-	InteractiveLogin                 bool
-	RedirectURL                      string
-	DefaultAuth                      bool
-	ClientOptions                    *azcore.ClientOptions
-	ApplicationForTracing            string
-	UserForTracing                   string
-	TokenCredential                  azcore.TokenCredential
+	DataSource                     string
+	AadUserID                      string
+	Password                       string
+	UserToken                      string
+	ApplicationClientId            string
+	ApplicationKey                 string
+	AuthorityId                    string
+	ApplicationCertificatePath     string
+	ApplicationCertificateBytes    []byte
+	ApplicationCertificatePassword []byte
+	SendCertificateChain           bool
+	ApplicationToken               string
+	AzCli                          bool
+	MsiAuthentication              bool
+	WorkloadAuthentication         bool
+	FederationTokenFilePath        string
+	ManagedServiceIdentity         string
+	InteractiveLogin               bool
+	RedirectURL                    string
+	DefaultAuth                    bool
+	ClientOptions                  *azcore.ClientOptions
+	ApplicationForTracing          string
+	UserForTracing                 string
+	TokenCredential                azcore.TokenCredential
 }
 
 const (
@@ -92,9 +97,7 @@ func assignValue(kcsb *ConnectionStringBuilder, rawKey string, value string) err
 	case applicationKey:
 		kcsb.ApplicationKey = value
 	case applicationCertificate:
-		kcsb.ApplicationCertificate = value
-	case applicationCertificateThumbprint:
-		kcsb.ApplicationCertificateThumbprint = value
+		kcsb.ApplicationCertificatePath = value
 	case sendCertificateChain:
 		bval, _ := strconv.ParseBool(value)
 		kcsb.SendCertificateChain = bval
@@ -152,12 +155,14 @@ func (kcsb *ConnectionStringBuilder) resetConnectionString() {
 	kcsb.ApplicationClientId = ""
 	kcsb.ApplicationKey = ""
 	kcsb.AuthorityId = ""
-	kcsb.ApplicationCertificate = ""
-	kcsb.ApplicationCertificateThumbprint = ""
+	kcsb.ApplicationCertificatePath = ""
+	kcsb.ApplicationCertificateBytes = nil
+	kcsb.ApplicationCertificatePassword = nil
 	kcsb.SendCertificateChain = false
 	kcsb.ApplicationToken = ""
 	kcsb.AzCli = false
 	kcsb.MsiAuthentication = false
+	kcsb.WorkloadAuthentication = false
 	kcsb.ManagedServiceIdentity = ""
 	kcsb.InteractiveLogin = false
 	kcsb.RedirectURL = ""
@@ -200,17 +205,34 @@ func (kcsb *ConnectionStringBuilder) WithAadAppKey(appId string, appKey string, 
 	return kcsb
 }
 
-// WithAppCertificate Creates a Kusto Connection string builder that will authenticate with AAD application using a certificate.
-func (kcsb *ConnectionStringBuilder) WithAppCertificate(appId string, certificate string, thumprint string, sendCertChain bool, authorityID string) *ConnectionStringBuilder {
+// WithAppCertificatePath Creates a Kusto Connection string builder that will authenticate with AAD application using a certificate.
+func (kcsb *ConnectionStringBuilder) WithAppCertificatePath(appId string, certificatePath string, password []byte, sendCertChain bool, authorityID string) *ConnectionStringBuilder {
 	requireNonEmpty(dataSource, kcsb.DataSource)
-	requireNonEmpty(applicationCertificate, certificate)
+	requireNonEmpty(applicationCertificate, certificatePath)
 	requireNonEmpty(authorityId, authorityID)
 	kcsb.resetConnectionString()
 	kcsb.ApplicationClientId = appId
 	kcsb.AuthorityId = authorityID
 
-	kcsb.ApplicationCertificate = certificate
-	kcsb.ApplicationCertificateThumbprint = thumprint
+	kcsb.ApplicationCertificatePath = certificatePath
+	kcsb.ApplicationCertificatePassword = password
+	kcsb.SendCertificateChain = sendCertChain
+	return kcsb
+}
+
+// WithAppCertificateBytes Creates a Kusto Connection string builder that will authenticate with AAD application using a certificate.
+func (kcsb *ConnectionStringBuilder) WithAppCertificateBytes(appId string, certificateBytes []byte, password []byte, sendCertChain bool, authorityID string) *ConnectionStringBuilder {
+	requireNonEmpty(dataSource, kcsb.DataSource)
+	requireNonEmpty(authorityId, authorityID)
+	if len(certificateBytes) == 0 {
+		panic("error: Certificate cannot be null")
+	}
+	kcsb.resetConnectionString()
+	kcsb.ApplicationClientId = appId
+	kcsb.AuthorityId = authorityID
+
+	kcsb.ApplicationCertificateBytes = certificateBytes
+	kcsb.ApplicationCertificatePassword = password
 	kcsb.SendCertificateChain = sendCertChain
 	return kcsb
 }
@@ -248,6 +270,18 @@ func (kcsb *ConnectionStringBuilder) WithSystemManagedIdentity() *ConnectionStri
 	requireNonEmpty(dataSource, kcsb.DataSource)
 	kcsb.resetConnectionString()
 	kcsb.MsiAuthentication = true
+	return kcsb
+}
+
+// WithKubernetesWorkloadIdentity Creates a Kusto Connection string builder that will authenticate with AAD application, using
+// an application token obtained from a Microsoft Service Identity endpoint using Kubernetes workload identity.
+func (kcsb *ConnectionStringBuilder) WithKubernetesWorkloadIdentity(appId, tokenFilePath, authorityID string) *ConnectionStringBuilder {
+	requireNonEmpty(dataSource, kcsb.DataSource)
+	kcsb.resetConnectionString()
+	kcsb.ApplicationClientId = appId
+	kcsb.AuthorityId = authorityID
+	kcsb.FederationTokenFilePath = tokenFilePath
+	kcsb.WorkloadAuthentication = true
 	return kcsb
 }
 
@@ -344,12 +378,23 @@ func (kcsb *ConnectionStringBuilder) newTokenProvider() (*TokenProvider, error) 
 
 			return cred, nil
 		}
-	case !isEmpty(kcsb.ApplicationCertificate):
+	case !isEmpty(kcsb.ApplicationCertificatePath) || len(kcsb.ApplicationCertificateBytes) != 0:
 		init = func(ci *CloudInfo, cliOpts *azcore.ClientOptions, appClientId string) (azcore.TokenCredential, error) {
 			opts := &azidentity.ClientCertificateCredentialOptions{ClientOptions: *cliOpts}
 			opts.SendCertificateChain = kcsb.SendCertificateChain
 
-			cert, thumprintKey, err := azidentity.ParseCertificates([]byte(kcsb.ApplicationCertificate), []byte(kcsb.ApplicationCertificateThumbprint))
+			bytes := kcsb.ApplicationCertificateBytes
+			if !isEmpty(kcsb.ApplicationCertificatePath) {
+				// read the certificate from the file
+				fileBytes, err := os.ReadFile(kcsb.ApplicationCertificatePath)
+				if err != nil {
+					return nil, kustoErrors.E(kustoErrors.OpTokenProvider, kustoErrors.KOther,
+						fmt.Errorf("error: Couldn't read certificate file: %s", err))
+				}
+				bytes = fileBytes
+			}
+
+			cert, thumprintKey, err := azidentity.ParseCertificates(bytes, kcsb.ApplicationCertificatePassword)
 			if err != nil {
 				return nil, kustoErrors.E(kustoErrors.OpTokenProvider, kustoErrors.KOther, err)
 			}
@@ -374,6 +419,29 @@ func (kcsb *ConnectionStringBuilder) newTokenProvider() (*TokenProvider, error) 
 			if err != nil {
 				return nil, kustoErrors.E(kustoErrors.OpTokenProvider, kustoErrors.KOther,
 					fmt.Errorf("error: Couldn't retrieve client credentials using Managed Identity: %s", err))
+			}
+
+			return cred, nil
+		}
+	case kcsb.WorkloadAuthentication:
+		init = func(ci *CloudInfo, cliOpts *azcore.ClientOptions, appClientId string) (azcore.TokenCredential, error) {
+			opts := &azidentity.WorkloadIdentityCredentialOptions{ClientOptions: *cliOpts}
+			if !isEmpty(kcsb.ApplicationClientId) {
+				opts.ClientID = kcsb.ApplicationClientId
+			}
+
+			if !isEmpty(kcsb.FederationTokenFilePath) {
+				opts.TokenFilePath = kcsb.FederationTokenFilePath
+			}
+
+			if !isEmpty(kcsb.AuthorityId) {
+				opts.TenantID = kcsb.AuthorityId
+			}
+
+			cred, err := azidentity.NewWorkloadIdentityCredential(opts)
+			if err != nil {
+				return nil, kustoErrors.E(kustoErrors.OpTokenProvider, kustoErrors.KOther,
+					fmt.Errorf("error: Couldn't retrieve client credentials using Workload Identity: %s", err))
 			}
 
 			return cred, nil

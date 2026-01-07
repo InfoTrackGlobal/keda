@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+// DefaultExchange is the default direct exchange that binds every queue by its
+// name. Applications can route to a queue using the queue name as routing key.
 const DefaultExchange = ""
 
 // Constants for standard AMQP 0-9-1 exchange types.
@@ -142,6 +144,19 @@ const (
 	flagReserved1       = 0x0004
 )
 
+// Expiration. These constants can be used to set a messages expiration TTL.
+// They should be viewed as a clarification of the expiration functionality in
+// messages and their usage is not enforced by this pkg.
+//
+// The server requires a string value that is interpreted by the server as
+// milliseconds. If no value is set, which translates to the nil value of
+// string, the message will never expire by itself. This does not influence queue
+// configured TTL configurations.
+const (
+	NeverExpire       string = ""  // empty value means never expire
+	ImmediatelyExpire string = "0" // 0 means immediately expire
+)
+
 // Queue captures the current server state of the queue on the server returned
 // from Channel.QueueDeclare or Channel.QueueInspect.
 type Queue struct {
@@ -160,18 +175,25 @@ type Publishing struct {
 	Headers Table
 
 	// Properties
-	ContentType     string    // MIME content type
-	ContentEncoding string    // MIME content encoding
-	DeliveryMode    uint8     // Transient (0 or 1) or Persistent (2)
-	Priority        uint8     // 0 to 9
-	CorrelationId   string    // correlation identifier
-	ReplyTo         string    // address to to reply to (ex: RPC)
-	Expiration      string    // message expiration spec
-	MessageId       string    // message identifier
-	Timestamp       time.Time // message timestamp
-	Type            string    // message type name
-	UserId          string    // creating user id - ex: "guest"
-	AppId           string    // creating application id
+	ContentType     string // MIME content type
+	ContentEncoding string // MIME content encoding
+	DeliveryMode    uint8  // Transient (0 or 1) or Persistent (2)
+	Priority        uint8  // 0 to 9
+	CorrelationId   string // correlation identifier
+	ReplyTo         string // address to to reply to (ex: RPC)
+	// Expiration represents the message TTL in milliseconds. A value of "0"
+	// indicates that the message will immediately expire if the message arrives
+	// at its destination and the message is not directly handled by a consumer
+	// that currently has the capacatity to do so. If you wish the message to
+	// not expire on its own, set this value to any ttl value, empty string or
+	// use the corresponding constants NeverExpire and ImmediatelyExpire. This
+	// does not influence queue configured TTL values.
+	Expiration string
+	MessageId  string    // message identifier
+	Timestamp  time.Time // message timestamp
+	Type       string    // message type name
+	UserId     string    // creating user id - ex: "guest"
+	AppId      string    // creating application id
 
 	// The application specific payload of the message
 	Body []byte
@@ -214,28 +236,38 @@ type Decimal struct {
 // Most common queue argument keys in queue declaration. For a comprehensive list
 // of queue arguments, visit [RabbitMQ Queue docs].
 //
-// QueueTypeArg queue argument is used to declare quorum and stream queues.
-// Accepted values are QueueTypeClassic (default), QueueTypeQuorum and
-// QueueTypeStream. [Quorum Queues] accept (almost) all queue arguments as their
+// [QueueTypeArg] queue argument is used to declare quorum and stream queues.
+// Accepted values are [QueueTypeClassic] (default), [QueueTypeQuorum] and
+// [QueueTypeStream]. [Quorum Queues] accept (almost) all queue arguments as their
 // Classic Queues counterparts. Check [feature comparison] docs for more
 // information.
 //
-// Queues can define their [max length] using QueueMaxLenArg and
-// QueueMaxLenBytesArg queue arguments. Overflow behaviour is set using
-// QueueOverflowArg. Accepted values are QueueOverflowDropHead (default),
-// QueueOverflowRejectPublish and QueueOverflowRejectPublishDLX.
+// Queues can define their [max length] using [QueueMaxLenArg] and
+// [QueueMaxLenBytesArg] queue arguments. Overflow behaviour is set using
+// [QueueOverflowArg]. Accepted values are [QueueOverflowDropHead] (default),
+// [QueueOverflowRejectPublish] and [QueueOverflowRejectPublishDLX].
 //
-// [Queue TTL] can be defined using QueueTTLArg. That is, the time-to-live for an
-// unused queue. [Queue Message TTL] can be defined using QueueMessageTTLArg.
-// This will set a time-to-live for **messages** in the queue.
+// [Queue TTL] can be defined using [QueueTTLArg]. That is, the time-to-live for an
+// unused queue. [Queue Message TTL] can be defined using [QueueMessageTTLArg].
+// This will set a time-to-live for messages in the queue.
 //
-// [Stream retention] can be configured using StreamMaxLenBytesArg, to set the
+// [Stream retention] can be configured using [StreamMaxLenBytesArg], to set the
 // maximum size of the stream. Please note that stream queues always keep, at
-// least, one segment. [Stream retention] can also be set using StreamMaxAgeArg,
+// least, one segment. [Stream retention] can also be set using [StreamMaxAgeArg],
 // to set time-based retention. Values are string with unit suffix. Valid
 // suffixes are Y, M, D, h, m, s. E.g. "7D" for one week. The maximum segment
-// size can be set using StreamMaxSegmentSizeBytesArg. The default value is
+// size can be set using [StreamMaxSegmentSizeBytesArg]. The default value is
 // 500_000_000 bytes ~= 500 megabytes
+//
+// Starting with RabbitMQ 3.12, consumer timeout can be configured as a queue
+// argument. This is the timeout for a consumer to acknowledge a message. The
+// value is the time in milliseconds. The timeout is evaluated periodically,
+// at one minute intervals. Values lower than one minute are not supported.
+// See the [consumer timeout] guide for more information.
+//
+// [Single Active Consumer] on quorum and classic queues can be configured
+// using [SingleActiveConsumerArg]. This argument expects a boolean value. It is
+// false by default.
 //
 // [RabbitMQ Queue docs]: https://rabbitmq.com/queues.html
 // [Stream retention]: https://rabbitmq.com/streams.html#retention
@@ -244,6 +276,8 @@ type Decimal struct {
 // [Queue Message TTL]: https://rabbitmq.com/ttl.html#per-queue-message-ttl
 // [Quorum Queues]: https://rabbitmq.com/quorum-queues.html
 // [feature comparison]: https://rabbitmq.com/quorum-queues.html#feature-comparison
+// [consumer timeout]: https://rabbitmq.com/consumers.html#acknowledgement-timeout
+// [Single Active Consumer]: https://rabbitmq.com/consumers.html#single-active-consumer
 const (
 	QueueTypeArg                 = "x-queue-type"
 	QueueMaxLenArg               = "x-max-length"
@@ -254,6 +288,11 @@ const (
 	QueueTTLArg                  = "x-expires"
 	StreamMaxAgeArg              = "x-max-age"
 	StreamMaxSegmentSizeBytesArg = "x-stream-max-segment-size-bytes"
+	// QueueVersionArg declares the Classic Queue version to use. Expects an integer, either 1 or 2.
+	QueueVersionArg = "x-queue-version"
+	// ConsumerTimeoutArg is available in RabbitMQ 3.12+ as a queue argument.
+	ConsumerTimeoutArg      = "x-consumer-timeout"
+	SingleActiveConsumerArg = "x-single-active-consumer"
 )
 
 // Values for queue arguments. Use as values for queue arguments during queue declaration.
@@ -265,6 +304,8 @@ const (
 //		amqp.QueueMaxLenArg: 100,
 //		amqp.QueueTTLArg: 1800000,
 //	}
+//
+// Refer to [Channel.QueueDeclare] for more examples.
 const (
 	QueueTypeClassic              = "classic"
 	QueueTypeQuorum               = "quorum"
@@ -512,3 +553,16 @@ type bodyFrame struct {
 }
 
 func (f *bodyFrame) channel() uint16 { return f.ChannelId }
+
+type heartbeatDuration struct {
+	value    time.Duration
+	hasValue bool
+}
+
+func newHeartbeatDurationFromSeconds(s int) heartbeatDuration {
+	v := time.Duration(s) * time.Second
+	return heartbeatDuration{
+		value:    v,
+		hasValue: true,
+	}
+}

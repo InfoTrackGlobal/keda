@@ -1,3 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Content before git sha 34fdeebefcbf183ed7f916f931aa0586fdaa1b40
+ * Copyright (c) 2016, The Gocql authors,
+ * provided under the BSD-3-Clause License.
+ * See the NOTICE file distributed with this work for additional information.
+ */
+
 package gocql
 
 import (
@@ -282,7 +306,7 @@ func (c *controlConn) setupConn(conn *Conn) error {
 	}
 
 	if err := c.registerEvents(conn); err != nil {
-		return err
+		return fmt.Errorf("register events: %v", err)
 	}
 
 	ch := &connHost{
@@ -347,6 +371,20 @@ func (c *controlConn) reconnect() {
 	}
 	defer atomic.StoreInt32(&c.reconnecting, 0)
 
+	conn, err := c.attemptReconnect()
+
+	if conn == nil {
+		c.session.logger.Printf("gocql: unable to reconnect control connection: %v\n", err)
+		return
+	}
+
+	err = c.session.refreshRing()
+	if err != nil {
+		c.session.logger.Printf("gocql: unable to refresh ring: %v\n", err)
+	}
+}
+
+func (c *controlConn) attemptReconnect() (*Conn, error) {
 	hosts := c.session.ring.allHosts()
 	hosts = shuffleHosts(hosts)
 
@@ -363,6 +401,25 @@ func (c *controlConn) reconnect() {
 		ch.conn.Close()
 	}
 
+	conn, err := c.attemptReconnectToAnyOfHosts(hosts)
+
+	if conn != nil {
+		return conn, err
+	}
+
+	c.session.logger.Printf("gocql: unable to connect to any ring node: %v\n", err)
+	c.session.logger.Printf("gocql: control falling back to initial contact points.\n")
+	// Fallback to initial contact points, as it may be the case that all known initialHosts
+	// changed their IPs while keeping the same hostname(s).
+	initialHosts, resolvErr := addrsToHosts(c.session.cfg.Hosts, c.session.cfg.Port, c.session.logger)
+	if resolvErr != nil {
+		return nil, fmt.Errorf("resolve contact points' hostnames: %v", resolvErr)
+	}
+
+	return c.attemptReconnectToAnyOfHosts(initialHosts)
+}
+
+func (c *controlConn) attemptReconnectToAnyOfHosts(hosts []*HostInfo) (*Conn, error) {
 	var conn *Conn
 	var err error
 	for _, host := range hosts {
@@ -379,15 +436,7 @@ func (c *controlConn) reconnect() {
 		conn.Close()
 		conn = nil
 	}
-	if conn == nil {
-		c.session.logger.Printf("gocql: control unable to register events: %v\n", err)
-		return
-	}
-
-	err = c.session.refreshRing()
-	if err != nil {
-		c.session.logger.Printf("gocql: unable to refresh ring: %v\n", err)
-	}
+	return conn, err
 }
 
 func (c *controlConn) HandleError(conn *Conn, err error, closed bool) {

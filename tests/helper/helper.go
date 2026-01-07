@@ -10,6 +10,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -35,16 +36,17 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/kedacore/keda/v2/pkg/generated/clientset/versioned/typed/keda/v1alpha1"
 )
 
 const (
-	AzureAdPodIdentityNamespace    = "azure-ad-identity-system"
 	AzureWorkloadIdentityNamespace = "azure-workload-identity-system"
 	AwsIdentityNamespace           = "aws-identity-system"
 	GcpIdentityNamespace           = "gcp-identity-system"
+	OpentelemetryNamespace         = "open-telemetry-system"
 	CertManagerNamespace           = "cert-manager"
 	KEDANamespace                  = "keda"
 	KEDAOperator                   = "keda-operator"
@@ -55,6 +57,10 @@ const (
 
 	StringFalse = "false"
 	StringTrue  = "true"
+
+	StrimziVersion   = "0.35.0"
+	StrimziChartName = "strimzi"
+	StrimziNamespace = "strimzi"
 )
 
 const (
@@ -71,11 +77,13 @@ var (
 	AzureADMsiID                  = os.Getenv("TF_AZURE_IDENTITY_1_APP_FULL_ID")
 	AzureADMsiClientID            = os.Getenv("TF_AZURE_IDENTITY_1_APP_ID")
 	AzureADTenantID               = os.Getenv("TF_AZURE_SP_TENANT")
-	AzureRunAadPodIdentityTests   = os.Getenv("AZURE_RUN_AAD_POD_IDENTITY_TESTS")
 	AzureRunWorkloadIdentityTests = os.Getenv("AZURE_RUN_WORKLOAD_IDENTITY_TESTS")
 	AwsIdentityTests              = os.Getenv("AWS_RUN_IDENTITY_TESTS")
 	GcpIdentityTests              = os.Getenv("GCP_RUN_IDENTITY_TESTS")
+	EnableOpentelemetry           = os.Getenv("ENABLE_OPENTELEMETRY")
 	InstallCertManager            = AwsIdentityTests == StringTrue || GcpIdentityTests == StringTrue
+	InstallKeda                   = os.Getenv("E2E_INSTALL_KEDA")
+	InstallKafka                  = os.Getenv("E2E_INSTALL_KAFKA")
 )
 
 var (
@@ -148,7 +156,7 @@ func ExecCommandOnSpecificPod(t *testing.T, podName string, namespace string, co
 	}
 	buf := &bytes.Buffer{}
 	errBuf := &bytes.Buffer{}
-	request := KubeClient.CoreV1().RESTClient().Post().
+	request := GetKubernetesClient(t).CoreV1().RESTClient().Post().
 		Resource("pods").Name(podName).Namespace(namespace).
 		SubResource("exec").Timeout(time.Second*20).
 		VersionedParams(&corev1.PodExecOptions{
@@ -238,13 +246,14 @@ func CreateNamespace(t *testing.T, kc *kubernetes.Clientset, nsName string) {
 func DeleteNamespace(t *testing.T, nsName string) {
 	t.Logf("deleting namespace %s", nsName)
 	period := int64(0)
-	err := KubeClient.CoreV1().Namespaces().Delete(context.Background(), nsName, metav1.DeleteOptions{
+	err := GetKubernetesClient(t).CoreV1().Namespaces().Delete(context.Background(), nsName, metav1.DeleteOptions{
 		GracePeriodSeconds: &period,
 	})
 	if errors.IsNotFound(err) {
 		err = nil
 	}
 	assert.NoErrorf(t, err, "cannot delete kubernetes namespace - %s", err)
+	DeletePodsInNamespace(t, nsName)
 }
 
 func WaitForJobSuccess(t *testing.T, kc *kubernetes.Clientset, jobName, namespace string, iterations, interval int) bool {
@@ -290,7 +299,7 @@ func WaitForAllJobsSuccess(t *testing.T, kc *kubernetes.Clientset, namespace str
 func WaitForNamespaceDeletion(t *testing.T, nsName string) bool {
 	for i := 0; i < 120; i++ {
 		t.Logf("waiting for namespace %s deletion", nsName)
-		_, err := KubeClient.CoreV1().Namespaces().Get(context.Background(), nsName, metav1.GetOptions{})
+		_, err := GetKubernetesClient(t).CoreV1().Namespaces().Get(context.Background(), nsName, metav1.GetOptions{})
 		if err != nil && errors.IsNotFound(err) {
 			return true
 		}
@@ -299,18 +308,15 @@ func WaitForNamespaceDeletion(t *testing.T, nsName string) bool {
 	return false
 }
 
-func WaitForScaledJobCount(t *testing.T, kc *kubernetes.Clientset, scaledJobName, namespace string,
-	target, iterations, intervalSeconds int) bool {
+func WaitForScaledJobCount(t *testing.T, kc *kubernetes.Clientset, scaledJobName, namespace string, target, iterations, intervalSeconds int) bool {
 	return waitForJobCount(t, kc, fmt.Sprintf("scaledjob.keda.sh/name=%s", scaledJobName), namespace, target, iterations, intervalSeconds)
 }
 
-func WaitForJobCount(t *testing.T, kc *kubernetes.Clientset, namespace string,
-	target, iterations, intervalSeconds int) bool {
+func WaitForJobCount(t *testing.T, kc *kubernetes.Clientset, namespace string, target, iterations, intervalSeconds int) bool {
 	return waitForJobCount(t, kc, "", namespace, target, iterations, intervalSeconds)
 }
 
-func waitForJobCount(t *testing.T, kc *kubernetes.Clientset, selector, namespace string,
-	target, iterations, intervalSeconds int) bool {
+func waitForJobCount(t *testing.T, kc *kubernetes.Clientset, selector, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
 		jobList, _ := kc.BatchV1().Jobs(namespace).List(context.Background(), metav1.ListOptions{
 			LabelSelector: selector,
@@ -330,9 +336,8 @@ func waitForJobCount(t *testing.T, kc *kubernetes.Clientset, selector, namespace
 	return false
 }
 
-func WaitForJobCountUntilIteration(t *testing.T, kc *kubernetes.Clientset, namespace string,
-	target, iterations, intervalSeconds int) bool {
-	var isTargetAchieved = false
+func WaitForJobCountUntilIteration(t *testing.T, kc *kubernetes.Clientset, namespace string, target, iterations, intervalSeconds int) bool {
+	isTargetAchieved := false
 
 	for i := 0; i < iterations; i++ {
 		jobList, _ := kc.BatchV1().Jobs(namespace).List(context.Background(), metav1.ListOptions{})
@@ -354,8 +359,7 @@ func WaitForJobCountUntilIteration(t *testing.T, kc *kubernetes.Clientset, names
 }
 
 // Waits until deployment count hits target or number of iterations are done.
-func WaitForPodCountInNamespace(t *testing.T, kc *kubernetes.Clientset, namespace string,
-	target, iterations, intervalSeconds int) bool {
+func WaitForPodCountInNamespace(t *testing.T, kc *kubernetes.Clientset, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
 		pods, _ := kc.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
 
@@ -398,9 +402,34 @@ func WaitForAllPodRunningInNamespace(t *testing.T, kc *kubernetes.Clientset, nam
 	return false
 }
 
+// Waits until the Horizontal Pod Autoscaler for the scaledObject reports that it has metrics available
+// to calculate, or until the number of iterations are done, whichever happens first.
+func WaitForHPAMetricsToPopulate(t *testing.T, kc *kubernetes.Clientset, name, namespace string, iterations, intervalSeconds int) bool {
+	totalWaitDuration := time.Duration(iterations) * time.Duration(intervalSeconds) * time.Second
+	startedWaiting := time.Now()
+	for i := 0; i < iterations; i++ {
+		t.Logf("Waiting up to %s for HPA to populate metrics - %s so far", totalWaitDuration, time.Since(startedWaiting).Round(time.Second))
+
+		hpa, _ := kc.AutoscalingV2().HorizontalPodAutoscalers(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		if hpa.Status.CurrentMetrics != nil {
+			for _, currentMetric := range hpa.Status.CurrentMetrics {
+				// When testing on a kind cluster at least, an empty metricStatus object with a blank type shows up first,
+				// so we need to make sure we have *actual* resource metrics before we return
+				if currentMetric.Type != "" {
+					j, _ := json.MarshalIndent(hpa.Status.CurrentMetrics, "  ", "    ")
+					t.Logf("HPA has metrics after %s: %s", time.Since(startedWaiting), j)
+					return true
+				}
+			}
+		}
+
+		time.Sleep(time.Duration(intervalSeconds) * time.Second)
+	}
+	return false
+}
+
 // Waits until deployment ready replica count hits target or number of iterations are done.
-func WaitForDeploymentReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, name, namespace string,
-	target, iterations, intervalSeconds int) bool {
+func WaitForDeploymentReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, name, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
 		deployment, _ := kc.AppsV1().Deployments(namespace).Get(context.Background(), name, metav1.GetOptions{})
 		replicas := deployment.Status.ReadyReplicas
@@ -419,8 +448,7 @@ func WaitForDeploymentReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, 
 }
 
 // Waits until statefulset count hits target or number of iterations are done.
-func WaitForStatefulsetReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, name, namespace string,
-	target, iterations, intervalSeconds int) bool {
+func WaitForStatefulsetReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, name, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
 		statefulset, _ := kc.AppsV1().StatefulSets(namespace).Get(context.Background(), name, metav1.GetOptions{})
 		replicas := statefulset.Status.ReadyReplicas
@@ -481,8 +509,7 @@ func AssertReplicaCountNotChangeDuringTimePeriod(t *testing.T, kc *kubernetes.Cl
 	}
 }
 
-func WaitForHpaCreation(t *testing.T, kc *kubernetes.Clientset, name, namespace string,
-	iterations, intervalSeconds int) (*autoscalingv2.HorizontalPodAutoscaler, error) {
+func WaitForHpaCreation(t *testing.T, kc *kubernetes.Clientset, name, namespace string, iterations, intervalSeconds int) (*autoscalingv2.HorizontalPodAutoscaler, error) {
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
 	var err error
 	for i := 0; i < iterations; i++ {
@@ -558,6 +585,27 @@ func KubectlApplyMultipleWithTemplate(t *testing.T, data interface{}, templates 
 	}
 }
 
+func KubectlReplaceWithTemplate(t *testing.T, data interface{}, templateName string, config string) {
+	t.Logf("Applying template: %s", templateName)
+
+	tmpl, err := template.New("kubernetes resource template").Parse(config)
+	assert.NoErrorf(t, err, "cannot parse template - %s", err)
+
+	tempFile, err := os.CreateTemp("", templateName)
+	assert.NoErrorf(t, err, "cannot create temp file - %s", err)
+
+	defer os.Remove(tempFile.Name())
+
+	err = tmpl.Execute(tempFile, data)
+	assert.NoErrorf(t, err, "cannot insert data into template - %s", err)
+
+	_, err = ExecuteCommand(fmt.Sprintf("kubectl replace -f %s --force", tempFile.Name()))
+	assert.NoErrorf(t, err, "cannot replace file - %s", err)
+
+	err = tempFile.Close()
+	assert.NoErrorf(t, err, "cannot close temp file - %s", err)
+}
+
 func KubectlDeleteWithTemplate(t *testing.T, data interface{}, templateName, config string) {
 	t.Logf("Deleting template: %s", templateName)
 
@@ -587,6 +635,22 @@ func KubectlDeleteMultipleWithTemplate(t *testing.T, data interface{}, templates
 	}
 }
 
+func KubectlCopyToPod(t *testing.T, content string, remotePath, pod, namespace string) {
+	tempFile, err := os.CreateTemp("", "copy-to-pod")
+	assert.NoErrorf(t, err, "cannot create temp file - %s", err)
+	defer os.Remove(tempFile.Name())
+
+	_, err = tempFile.WriteString(content)
+	assert.NoErrorf(t, err, "cannot write temp file - %s", err)
+
+	commnand := fmt.Sprintf("kubectl cp %s %s:/%s -n %s", tempFile.Name(), pod, remotePath, namespace)
+	_, err = ExecuteCommand(commnand)
+	assert.NoErrorf(t, err, "cannot copy file - %s", err)
+
+	err = tempFile.Close()
+	assert.NoErrorf(t, err, "cannot close temp file - %s", err)
+}
+
 func CreateKubernetesResources(t *testing.T, kc *kubernetes.Clientset, nsName string, data interface{}, templates []Template) {
 	CreateNamespace(t, kc, nsName)
 	KubectlApplyMultipleWithTemplate(t, data, templates)
@@ -608,21 +672,22 @@ func RemoveANSI(input string) string {
 	return reg.ReplaceAllString(input, "")
 }
 
-func FindPodLogs(kc *kubernetes.Clientset, namespace, label string) ([]string, error) {
-	var podLogs []string
+func FindPodLogs(kc *kubernetes.Clientset, namespace, label string, includePrevious bool) ([]string, error) {
 	pods, err := kc.CoreV1().Pods(namespace).List(context.TODO(),
 		metav1.ListOptions{LabelSelector: label})
 	if err != nil {
 		return []string{}, err
 	}
-	var podLogRequest *rest.Request
-	for _, v := range pods.Items {
-		podLogRequest = kc.CoreV1().Pods(namespace).GetLogs(v.Name, &corev1.PodLogOptions{})
+	getPodLogs := func(pod *corev1.Pod, previous bool) ([]string, error) {
+		podLogRequest := kc.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			Previous: previous,
+		})
 		stream, err := podLogRequest.Stream(context.TODO())
 		if err != nil {
 			return []string{}, err
 		}
 		defer stream.Close()
+		logs := []string{}
 		for {
 			buf := make([]byte, 2000)
 			numBytes, err := stream.Read(buf)
@@ -635,24 +700,64 @@ func FindPodLogs(kc *kubernetes.Clientset, namespace, label string) ([]string, e
 			if err != nil {
 				return []string{}, err
 			}
-			podLogs = append(podLogs, string(buf[:numBytes]))
+			logs = append(logs, string(buf[:numBytes]))
 		}
+		return logs, nil
 	}
-	return podLogs, nil
+
+	var outputLogs []string
+	for _, pod := range pods.Items {
+		getPrevious := false
+		if includePrevious {
+			for _, container := range pod.Status.ContainerStatuses {
+				if container.RestartCount > 0 {
+					getPrevious = true
+				}
+			}
+		}
+
+		if getPrevious {
+			podLogs, err := getPodLogs(&pod, true)
+			if err != nil {
+				return []string{}, err
+			}
+			outputLogs = append(outputLogs, podLogs...)
+			outputLogs = append(outputLogs, "=====================RESTART=====================\n")
+		}
+
+		podLogs, err := getPodLogs(&pod, false)
+		if err != nil {
+			return []string{}, err
+		}
+		outputLogs = append(outputLogs, podLogs...)
+	}
+	return outputLogs, nil
 }
 
 // Delete all pods in namespace by selector
 func DeletePodsInNamespaceBySelector(t *testing.T, kc *kubernetes.Clientset, selector, namespace string) {
 	t.Logf("killing all pods in %s namespace with selector %s", namespace, selector)
-	err := kc.CoreV1().Pods(namespace).DeleteCollection(context.Background(), metav1.DeleteOptions{}, metav1.ListOptions{
+	err := kc.CoreV1().Pods(namespace).DeleteCollection(context.Background(), metav1.DeleteOptions{
+		GracePeriodSeconds: ptr.To(int64(0)),
+	}, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	assert.NoErrorf(t, err, "cannot delete pods - %s", err)
 }
 
+// Delete all pods in namespace
+func DeletePodsInNamespace(t *testing.T, namespace string) {
+	err := GetKubernetesClient(t).CoreV1().Pods(namespace).DeleteCollection(context.Background(), metav1.DeleteOptions{
+		GracePeriodSeconds: ptr.To(int64(0)),
+	}, metav1.ListOptions{})
+	if errors.IsNotFound(err) {
+		err = nil
+	}
+	assert.NoErrorf(t, err, "cannot delete pods - %s", err)
+}
+
 // Wait for Pods identified by selector to complete termination
-func WaitForPodsTerminated(t *testing.T, kc *kubernetes.Clientset, selector, namespace string,
-	iterations, intervalSeconds int) bool {
+func WaitForPodsTerminated(t *testing.T, kc *kubernetes.Clientset, selector, namespace string, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
 		pods, err := kc.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
 		if (err != nil && errors.IsNotFound(err)) || len(pods.Items) == 0 {

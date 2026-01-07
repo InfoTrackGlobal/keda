@@ -1,7 +1,7 @@
 //go:build e2e
 // +build e2e
 
-package azure_service_bus_queue_aad_pod_identity_test
+package azure_service_bus_queue_wi_test
 
 import (
 	"context"
@@ -63,7 +63,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginxinc/nginx-unprivileged
+          image: ghcr.io/nginx/nginx-unprivileged:1.26
 `
 
 	triggerAuthTemplate = `

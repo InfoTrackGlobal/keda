@@ -13,6 +13,8 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/gcp"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -33,7 +35,7 @@ type gcsScaler struct {
 
 type gcsMetadata struct {
 	bucketName                  string
-	gcpAuthorization            *gcpAuthorizationMetadata
+	gcpAuthorization            *gcp.AuthorizationMetadata
 	maxBucketItemsToScan        int64
 	metricName                  string
 	targetObjectCount           int64
@@ -43,7 +45,7 @@ type gcsMetadata struct {
 }
 
 // NewGcsScaler creates a new gcsScaler
-func NewGcsScaler(config *ScalerConfig) (Scaler, error) {
+func NewGcsScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -61,7 +63,7 @@ func NewGcsScaler(config *ScalerConfig) (Scaler, error) {
 	var client *storage.Client
 
 	switch {
-	case meta.gcpAuthorization.podIdentityProviderEnabled:
+	case meta.gcpAuthorization.PodIdentityProviderEnabled:
 		client, err = storage.NewClient(ctx)
 	case meta.gcpAuthorization.GoogleApplicationCredentialsFile != "":
 		client, err = storage.NewClient(
@@ -91,7 +93,7 @@ func NewGcsScaler(config *ScalerConfig) (Scaler, error) {
 	}, nil
 }
 
-func parseGcsMetadata(config *ScalerConfig, logger logr.Logger) (*gcsMetadata, error) {
+func parseGcsMetadata(config *scalersconfig.ScalerConfig, logger logr.Logger) (*gcsMetadata, error) {
 	meta := gcsMetadata{}
 	meta.targetObjectCount = defaultTargetObjectCount
 	meta.maxBucketItemsToScan = defaultMaxBucketItemsToScan
@@ -145,14 +147,14 @@ func parseGcsMetadata(config *ScalerConfig, logger logr.Logger) (*gcsMetadata, e
 		meta.blobPrefix = val
 	}
 
-	auth, err := getGCPAuthorization(config)
+	auth, err := gcp.GetGCPAuthorization(config)
 	if err != nil {
 		return nil, err
 	}
 	meta.gcpAuthorization = auth
 
 	var metricName = kedautil.NormalizeString(fmt.Sprintf("gcp-storage-%s", meta.bucketName))
-	meta.metricName = GenerateMetricNameWithIndex(config.ScalerIndex, metricName)
+	meta.metricName = GenerateMetricNameWithIndex(config.TriggerIndex, metricName)
 
 	return &meta, nil
 }
@@ -191,7 +193,7 @@ func (s *gcsScaler) GetMetricsAndActivity(ctx context.Context, metricName string
 // getItemCount gets the number of items in the bucket, up to maxCount
 func (s *gcsScaler) getItemCount(ctx context.Context, maxCount int64) (int64, error) {
 	query := &storage.Query{Delimiter: s.metadata.blobDelimiter, Prefix: s.metadata.blobPrefix}
-	err := query.SetAttrSelection([]string{"Name"})
+	err := query.SetAttrSelection([]string{"Size"})
 	if err != nil {
 		s.logger.Error(err, "failed to set attribute selection")
 		return 0, err
@@ -201,17 +203,22 @@ func (s *gcsScaler) getItemCount(ctx context.Context, maxCount int64) (int64, er
 	var count int64
 
 	for count < maxCount {
-		_, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
+		item, err := it.Next()
 		if err != nil {
+			if errors.Is(err, iterator.Done) {
+				break
+			}
 			if errors.Is(err, storage.ErrBucketNotExist) {
 				s.logger.Info("Bucket " + s.metadata.bucketName + " doesn't exist")
 				return 0, nil
 			}
 			s.logger.Error(err, "failed to enumerate items in bucket "+s.metadata.bucketName)
 			return count, err
+		}
+		// The folder is retrieved as an entity, so if size is 0
+		// we can skip it
+		if item.Size == 0 {
+			continue
 		}
 		count++
 	}

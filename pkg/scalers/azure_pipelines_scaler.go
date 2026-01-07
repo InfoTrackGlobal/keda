@@ -7,25 +7,32 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/go-logr/logr"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/scalers/azure"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
-)
-
-const (
-	defaultTargetPipelinesQueueLength = 1
 )
 
 type JobRequests struct {
 	Count int          `json:"count"`
 	Value []JobRequest `json:"value"`
 }
+
+const (
+	// "499b84ac-1321-427f-aa17-267ca6975798" is the azure id for DevOps resource
+	// https://learn.microsoft.com/en-gb/azure/devops/integrate/get-started/authentication/service-principal-managed-identity?view=azure-devops
+	devopsResource = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+)
 
 type JobRequest struct {
 	RequestID     int       `json:"requestId"`
@@ -119,51 +126,74 @@ type azurePipelinesPoolIDResponse struct {
 }
 
 type azurePipelinesScaler struct {
-	metricType v2.MetricTargetType
-	metadata   *azurePipelinesMetadata
-	httpClient *http.Client
-	logger     logr.Logger
+	metricType  v2.MetricTargetType
+	metadata    *azurePipelinesMetadata
+	httpClient  *http.Client
+	podIdentity kedav1alpha1.AuthPodIdentity
+	logger      logr.Logger
 }
 
 type azurePipelinesMetadata struct {
-	organizationURL                      string
-	organizationName                     string
-	clientID                             string
-	clientSecret                         string
-	tenantID                             string
-	personalAccessToken                  string
-	parent                               string
-	demands                              string
-	poolID                               int
-	targetPipelinesQueueLength           int64
-	activationTargetPipelinesQueueLength int64
-	jobsToFetch                          int64
-	scalerIndex                          int
-	requireAllDemands                    bool
+
+	OrganizationURL                      string `keda:"name=organizationURL,          order=resolvedEnv;authParams"`
+	OrganizationName                     string
+	// Custom auth fields for client credentials
+	ClientID                             string `keda:"name=clientID,          order=authParams, optional"`
+	ClientSecret                         string `keda:"name=clientSecret,          order=authParams, optional"`
+	TenantID                             string `keda:"name=tenantID,          order=authParams, optional"`
+	authContext                          authContext
+	Parent                               string `keda:"name=parent,          order=triggerMetadata, optional"`
+	Demands                              string `keda:"name=demands,          order=triggerMetadata, optional"`
+	PoolName                             string `keda:"name=poolName,          order=triggerMetadata, optional"`
+	PoolID                               int    `keda:"name=poolID,          order=triggerMetadata, optional"`
+	TargetPipelinesQueueLength           int64  `keda:"name=targetPipelinesQueueLength,          order=triggerMetadata, default=1, optional"`
+	ActivationTargetPipelinesQueueLength int64  `keda:"name=activationTargetPipelinesQueueLength,          order=triggerMetadata, default=0, optional"`
+	JobsToFetch                          int64  `keda:"name=jobsToFetch,          order=triggerMetadata, default=250, optional"`
+	triggerIndex                         int
+	RequireAllDemands                    bool `keda:"name=requireAllDemands,          order=triggerMetadata, default=false, optional"`
+	RequireAllDemandsAndIgnoreOthers     bool `keda:"name=requireAllDemandsAndIgnoreOthers,          order=triggerMetadata, default=false, optional"`
+}
+
+type authContext struct {
+	cred  *azidentity.ChainedTokenCredential
+	pat   string
+	token *azcore.AccessToken
+}
+
+func (a *azurePipelinesMetadata) Validate() error {
+	if val := a.OrganizationURL[strings.LastIndex(a.OrganizationURL, "/")+1:]; val != "" {
+		a.OrganizationName = a.OrganizationURL[strings.LastIndex(a.OrganizationURL, "/")+1:]
+	} else {
+		return fmt.Errorf("failed to extract organization name from organizationURL")
+	}
+	return nil
 }
 
 // NewAzurePipelinesScaler creates a new AzurePipelinesScaler
-func NewAzurePipelinesScaler(ctx context.Context, config *ScalerConfig) (Scaler, error) {
+func NewAzurePipelinesScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
 	httpClient := kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false)
 
+	logger := InitializeLogger(config, "azure_pipelines_scaler")
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
 	}
 
-	meta, err := parseAzurePipelinesMetadata(ctx, config, httpClient)
+	meta, podIdentity, err := parseAzurePipelinesMetadata(ctx, logger, config, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing azure Pipelines metadata: %w", err)
 	}
 
 	return &azurePipelinesScaler{
-		metricType: metricType,
-		metadata:   meta,
-		httpClient: httpClient,
-		logger:     InitializeLogger(config, "azure_pipelines_scaler"),
+		metricType:  metricType,
+		metadata:    meta,
+		httpClient:  httpClient,
+		podIdentity: podIdentity,
+		logger:      logger,
 	}, nil
 }
 
+// Custom function to get access token using client credentials
 func getAccessTokenWithClientCredentials(ctx context.Context, clientID string, clientSecret string, tenantID string) (string, error) {
 	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", tenantID)
 
@@ -201,132 +231,113 @@ func getAccessTokenWithClientCredentials(ctx context.Context, clientID string, c
 	return tokenResponse.AccessToken, nil
 }
 
-func parseAzurePipelinesMetadata(ctx context.Context, config *ScalerConfig, httpClient *http.Client) (*azurePipelinesMetadata, error) {
-	meta := azurePipelinesMetadata{}
-	meta.targetPipelinesQueueLength = defaultTargetPipelinesQueueLength
-
-	if val, ok := config.TriggerMetadata["targetPipelinesQueueLength"]; ok {
-		queueLength, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing azure pipelines metadata targetPipelinesQueueLength: %w", err)
+func getAuthMethod(logger logr.Logger, config *scalersconfig.ScalerConfig) (string, *azidentity.ChainedTokenCredential, kedav1alpha1.AuthPodIdentity, error) {
+	pat := ""
+	
+	// Check for client credentials first (your custom auth method)
+	if clientID, hasClientID := config.AuthParams["clientID"]; hasClientID && clientID != "" {
+		clientSecret := config.AuthParams["clientSecret"]
+		tenantID := config.AuthParams["tenantID"]
+		
+		if clientSecret == "" || tenantID == "" {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("clientID provided but missing clientSecret or tenantID")
 		}
-
-		meta.targetPipelinesQueueLength = queueLength
-	}
-
-	meta.activationTargetPipelinesQueueLength = 0
-	if val, ok := config.TriggerMetadata["activationTargetPipelinesQueueLength"]; ok {
-		activationQueueLength, err := strconv.ParseInt(val, 10, 64)
+		
+		// Get token using client credentials
+		token, err := getAccessTokenWithClientCredentials(context.Background(), clientID, clientSecret, tenantID)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing azure pipelines metadata activationTargetPipelinesQueueLength: %w", err)
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("failed to obtain access token with client credentials: %w", err)
 		}
-
-		meta.activationTargetPipelinesQueueLength = activationQueueLength
+		
+		return token, nil, kedav1alpha1.AuthPodIdentity{}, nil
 	}
-
-	if val, ok := config.AuthParams["organizationURL"]; ok && val != "" {
-		// Found the organizationURL in a parameter from TriggerAuthentication
-		meta.organizationURL = val
-	} else if val, ok := config.TriggerMetadata["organizationURLFromEnv"]; ok && val != "" {
-		meta.organizationURL = config.ResolvedEnv[val]
-	} else {
-		return nil, fmt.Errorf("no organizationURL given")
+	
+	// Check for environment-based client credentials
+	if clientIDFromEnv, hasClientIDFromEnv := config.TriggerMetadata["clientIDFromEnv"]; hasClientIDFromEnv && clientIDFromEnv != "" {
+		clientID := config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
+		clientSecret := config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
+		tenantID := config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
+		
+		if clientID == "" || clientSecret == "" || tenantID == "" {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("incomplete client credentials from environment")
+		}
+		
+		token, err := getAccessTokenWithClientCredentials(context.Background(), clientID, clientSecret, tenantID)
+		if err != nil {
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("failed to obtain access token with client credentials: %w", err)
+		}
+		
+		return token, nil, kedav1alpha1.AuthPodIdentity{}, nil
 	}
-
-	if val := meta.organizationURL[strings.LastIndex(meta.organizationURL, "/")+1:]; val != "" {
-		meta.organizationName = meta.organizationURL[strings.LastIndex(meta.organizationURL, "/")+1:]
-	} else {
-		return nil, fmt.Errorf("failed to extract organization name from organizationURL")
-	}
-
-	if val, ok := config.AuthParams["clientID"]; ok && val != "" {
-		meta.clientID = val
-		meta.clientSecret = config.AuthParams["clientSecret"]
-		meta.tenantID = config.AuthParams["tenantID"]
-	} else if val, ok := config.TriggerMetadata["clientIDFromEnv"]; ok && val != "" {
-		meta.clientID = config.ResolvedEnv[config.TriggerMetadata["clientIDFromEnv"]]
-		meta.clientSecret = config.ResolvedEnv[config.TriggerMetadata["clientSecretFromEnv"]]
-		meta.tenantID = config.ResolvedEnv[config.TriggerMetadata["tenantIDFromEnv"]]
-	} else if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
+	
+	// Check for PAT
+	if val, ok := config.AuthParams["personalAccessToken"]; ok && val != "" {
 		// Found the personalAccessToken in a parameter from TriggerAuthentication
-		meta.personalAccessToken = config.AuthParams["personalAccessToken"]
+		pat = config.AuthParams["personalAccessToken"]
 	} else if val, ok := config.TriggerMetadata["personalAccessTokenFromEnv"]; ok && val != "" {
-		meta.personalAccessToken = config.ResolvedEnv[config.TriggerMetadata["personalAccessTokenFromEnv"]]
+		pat = config.ResolvedEnv[config.TriggerMetadata["personalAccessTokenFromEnv"]]
 	} else {
-		return nil, fmt.Errorf("no valid authentication method provided")
-	}
-
-	// Check if clientID and clientSecret are provided for authentication
-	if meta.clientID != "" {
-		token, err := getAccessTokenWithClientCredentials(ctx, meta.clientID, meta.clientSecret, meta.tenantID)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to obtain access token: %w\n", err)
-		}
-
-		// Use the token for further requests
-		meta.personalAccessToken = token
-	}
-
-	if val, ok := config.TriggerMetadata["parent"]; ok && val != "" {
-		meta.parent = config.TriggerMetadata["parent"]
-	} else {
-		meta.parent = ""
-	}
-
-	if val, ok := config.TriggerMetadata["demands"]; ok && val != "" {
-		meta.demands = config.TriggerMetadata["demands"]
-	} else {
-		meta.demands = ""
-	}
-
-	meta.jobsToFetch = 250
-	if val, ok := config.TriggerMetadata["jobsToFetch"]; ok && val != "" {
-		jobsToFetch, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing jobsToFetch: %w", err)
-		}
-		meta.jobsToFetch = jobsToFetch
-	}
-
-	meta.requireAllDemands = false
-	if val, ok := config.TriggerMetadata["requireAllDemands"]; ok && val != "" {
-		requireAllDemands, err := strconv.ParseBool(val)
-		if err != nil {
-			return nil, err
-		}
-		meta.requireAllDemands = requireAllDemands
-	}
-
-	if val, ok := config.TriggerMetadata["poolName"]; ok && val != "" {
-		var err error
-		poolID, err := getPoolIDFromName(ctx, val, &meta, httpClient)
-		if err != nil {
-			return nil, err
-		}
-		meta.poolID = poolID
-	} else {
-		if val, ok := config.TriggerMetadata["poolID"]; ok && val != "" {
-			var err error
-			poolID, err := validatePoolID(ctx, val, &meta, httpClient)
+		switch config.PodIdentity.Provider {
+		case "", kedav1alpha1.PodIdentityProviderNone:
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("no personalAccessToken given or PodIdentity provider configured")
+		case kedav1alpha1.PodIdentityProviderAzureWorkload:
+			cred, err := azure.NewChainedCredential(logger, config.PodIdentity)
 			if err != nil {
-				return nil, err
+				return "", nil, kedav1alpha1.AuthPodIdentity{}, err
 			}
-			meta.poolID = poolID
-		} else {
-			return nil, fmt.Errorf("no poolName or poolID given")
+			return "", cred, kedav1alpha1.AuthPodIdentity{Provider: config.PodIdentity.Provider}, nil
+		default:
+			return "", nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("pod identity %s not supported for azure pipelines", config.PodIdentity.Provider)
 		}
 	}
-
-	// Trim any trailing new lines from the Azure Pipelines PAT
-	meta.personalAccessToken = strings.TrimSuffix(meta.personalAccessToken, "\n")
-	meta.scalerIndex = config.ScalerIndex
-
-	return &meta, nil
+	return pat, nil, kedav1alpha1.AuthPodIdentity{}, nil
 }
 
-func getPoolIDFromName(ctx context.Context, poolName string, metadata *azurePipelinesMetadata, httpClient *http.Client) (int, error) {
-	url := fmt.Sprintf("%s/_apis/distributedtask/pools?poolName=%s", metadata.organizationURL, poolName)
-	body, err := getAzurePipelineRequest(ctx, url, metadata, httpClient)
+func parseAzurePipelinesMetadata(ctx context.Context, logger logr.Logger, config *scalersconfig.ScalerConfig, httpClient *http.Client) (*azurePipelinesMetadata, kedav1alpha1.AuthPodIdentity, error) {
+	meta := &azurePipelinesMetadata{}
+	if err := config.TypedConfig(meta); err != nil {
+		return nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("error parsing azure pipeline metadata: %w", err)
+	}
+
+	meta.triggerIndex = config.TriggerIndex
+
+	pat, cred, podIdentity, err := getAuthMethod(logger, config)
+	if err != nil {
+		return nil, kedav1alpha1.AuthPodIdentity{}, err
+	}
+	// Trim any trailing new lines from the Azure Pipelines PAT
+	meta.authContext = authContext{
+		pat:   strings.TrimSuffix(pat, "\n"),
+		cred:  cred,
+		token: nil,
+	}
+
+	if meta.PoolName != "" {
+		var err error
+		poolID, err := getPoolIDFromName(ctx, logger, meta.PoolName, meta, podIdentity, httpClient)
+		if err != nil {
+			return nil, kedav1alpha1.AuthPodIdentity{}, err
+		}
+		meta.PoolID = poolID
+	} else if meta.PoolID != 0 {
+		var err error
+		_, err = validatePoolID(ctx, logger, meta.PoolID, meta, podIdentity, httpClient)
+		if err != nil {
+			return nil, kedav1alpha1.AuthPodIdentity{}, err
+		}
+	} else {
+		return nil, kedav1alpha1.AuthPodIdentity{}, fmt.Errorf("no poolName or poolID given")
+	}
+
+	meta.triggerIndex = config.TriggerIndex
+
+	return meta, podIdentity, nil
+}
+
+func getPoolIDFromName(ctx context.Context, logger logr.Logger, poolName string, metadata *azurePipelinesMetadata, podIdentity kedav1alpha1.AuthPodIdentity, httpClient *http.Client) (int, error) {
+	urlString := fmt.Sprintf("%s/_apis/distributedtask/pools?poolName=%s", metadata.OrganizationURL, url.QueryEscape(poolName))
+	body, err := getAzurePipelineRequest(ctx, logger, urlString, metadata, podIdentity, httpClient)
+
 	if err != nil {
 		return -1, err
 	}
@@ -349,11 +360,12 @@ func getPoolIDFromName(ctx context.Context, poolName string, metadata *azurePipe
 	return result.Value[0].ID, nil
 }
 
-func validatePoolID(ctx context.Context, poolID string, metadata *azurePipelinesMetadata, httpClient *http.Client) (int, error) {
-	url := fmt.Sprintf("%s/_apis/distributedtask/pools?poolID=%s", metadata.organizationURL, poolID)
-	body, err := getAzurePipelineRequest(ctx, url, metadata, httpClient)
+func validatePoolID(ctx context.Context, logger logr.Logger, poolID int, metadata *azurePipelinesMetadata, podIdentity kedav1alpha1.AuthPodIdentity, httpClient *http.Client) (int, error) {
+	urlString := fmt.Sprintf("%s/_apis/distributedtask/pools?poolID=%d", metadata.OrganizationURL, poolID)
+	body, err := getAzurePipelineRequest(ctx, logger, urlString, metadata, podIdentity, httpClient)
+
 	if err != nil {
-		return -1, fmt.Errorf("agent pool with id `%s` not found: %w", poolID, err)
+		return -1, fmt.Errorf("agent pool with id `%d` not found: %w", poolID, err)
 	}
 
 	var result azurePipelinesPoolIDResponse
@@ -365,13 +377,49 @@ func validatePoolID(ctx context.Context, poolID string, metadata *azurePipelines
 	return result.ID, nil
 }
 
-func getAzurePipelineRequest(ctx context.Context, url string, metadata *azurePipelinesMetadata, httpClient *http.Client) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func getToken(ctx context.Context, metadata *azurePipelinesMetadata, scope string) (string, error) {
+	if metadata.authContext.token != nil {
+		//if token expires after more then minute from now let's reuse
+		if metadata.authContext.token.ExpiresOn.After(time.Now().Add(time.Second * 60)) {
+			return metadata.authContext.token.Token, nil
+		}
+	}
+	token, err := metadata.authContext.cred.GetToken(ctx, policy.TokenRequestOptions{
+		Scopes: []string{
+			scope,
+		},
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	metadata.authContext.token = &token
+
+	return metadata.authContext.token.Token, nil
+}
+
+func getAzurePipelineRequest(ctx context.Context, logger logr.Logger, urlString string, metadata *azurePipelinesMetadata, podIdentity kedav1alpha1.AuthPodIdentity, httpClient *http.Client) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", urlString, nil)
 	if err != nil {
 		return []byte{}, err
 	}
 
-	req.SetBasicAuth("", metadata.personalAccessToken)
+	switch podIdentity.Provider {
+	case "", kedav1alpha1.PodIdentityProviderNone:
+		//PAT or client credentials token
+		logger.V(1).Info("making request to ADO REST API using PAT or client credentials")
+		req.SetBasicAuth("", metadata.authContext.pat)
+	case kedav1alpha1.PodIdentityProviderAzureWorkload:
+		//ADO Resource token
+		logger.V(1).Info("making request to ADO REST API using managed identity")
+		aadToken, err := getToken(ctx, metadata, devopsResource)
+		if err != nil {
+			return []byte{}, fmt.Errorf("cannot create workload identity credentials: %w", err)
+		}
+		logger.V(1).Info("token acquired setting auth header as 'bearer XXXXXX'")
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", aadToken))
+	}
 
 	r, err := httpClient.Do(req)
 	if err != nil {
@@ -385,7 +433,17 @@ func getAzurePipelineRequest(ctx context.Context, url string, metadata *azurePip
 	r.Body.Close()
 
 	if !(r.StatusCode >= 200 && r.StatusCode <= 299) {
-		return []byte{}, fmt.Errorf("the Azure DevOps REST API returned error. url: %s status: %d response: %s", url, r.StatusCode, string(b))
+		return []byte{}, fmt.Errorf("the Azure DevOps REST API returned error. urlString: %s status: %d response: %s", urlString, r.StatusCode, string(b))
+	}
+
+	// Log when API Rate Limits are reached
+	rateLimitRemaining := r.Header[http.CanonicalHeaderKey("X-RateLimit-Remaining")]
+	if rateLimitRemaining != nil {
+		logger.V(1).Info(fmt.Sprintf("Warning: ADO TSTUs Left %s. When reaching zero requests are delayed, lower the polling interval. See https://learn.microsoft.com/en-us/azure/devops/integrate/concepts/rate-limits?view=azure-devops", rateLimitRemaining))
+	}
+	rateLimitDelay := r.Header[http.CanonicalHeaderKey("X-RateLimit-Delay")]
+	if rateLimitDelay != nil {
+		logger.V(1).Info(fmt.Sprintf("Warning: Request to ADO API is delayed by %s seconds. Sending additional requests will increase delay until results are being blocked entirely", rateLimitDelay))
 	}
 
 	return b, nil
@@ -393,13 +451,13 @@ func getAzurePipelineRequest(ctx context.Context, url string, metadata *azurePip
 
 func (s *azurePipelinesScaler) GetAzurePipelinesQueueLength(ctx context.Context) (int64, error) {
 	// HotFix Issue (#4387), $top changes the format of the returned JSON
-	var url string
-	if s.metadata.parent != "" {
-		url = fmt.Sprintf("%s/_apis/distributedtask/pools/%d/jobrequests", s.metadata.organizationURL, s.metadata.poolID)
+	var urlString string
+	if s.metadata.Parent != "" {
+		urlString = fmt.Sprintf("%s/_apis/distributedtask/pools/%d/jobrequests", s.metadata.OrganizationURL, s.metadata.PoolID)
 	} else {
-		url = fmt.Sprintf("%s/_apis/distributedtask/pools/%d/jobrequests?$top=%d", s.metadata.organizationURL, s.metadata.poolID, s.metadata.jobsToFetch)
+		urlString = fmt.Sprintf("%s/_apis/distributedtask/pools/%d/jobrequests?$top=%d", s.metadata.OrganizationURL, s.metadata.PoolID, s.metadata.JobsToFetch)
 	}
-	body, err := getAzurePipelineRequest(ctx, url, s.metadata, s.httpClient)
+	body, err := getAzurePipelineRequest(ctx, s.logger, urlString, s.metadata, s.podIdentity, s.httpClient)
 	if err != nil {
 		return -1, err
 	}
@@ -414,11 +472,11 @@ func (s *azurePipelinesScaler) GetAzurePipelinesQueueLength(ctx context.Context)
 	// for each job check if its parent fulfilled, then demand fulfilled, then finally pool fulfilled
 	var count int64
 	for _, job := range stripDeadJobs(jrs.Value) {
-		if s.metadata.parent == "" && s.metadata.demands == "" {
+		if s.metadata.Parent == "" && s.metadata.Demands == "" {
 			// no plan defined, just add a count
 			count++
 		} else {
-			if s.metadata.parent == "" {
+			if s.metadata.Parent == "" {
 				// doesn't use parent, switch to demand
 				if getCanAgentDemandFulfilJob(job, s.metadata) {
 					count++
@@ -460,7 +518,7 @@ func stripAgentVFromArray(array []string) []string {
 func getCanAgentDemandFulfilJob(jr JobRequest, metadata *azurePipelinesMetadata) bool {
 	countDemands := 0
 	demandsInJob := stripAgentVFromArray(jr.Demands)
-	demandsInScaler := stripAgentVFromArray(strings.Split(metadata.demands, ","))
+	demandsInScaler := stripAgentVFromArray(strings.Split(metadata.Demands, ","))
 
 	for _, demandInJob := range demandsInJob {
 		for _, demandInScaler := range demandsInScaler {
@@ -470,8 +528,10 @@ func getCanAgentDemandFulfilJob(jr JobRequest, metadata *azurePipelinesMetadata)
 		}
 	}
 
-	if metadata.requireAllDemands {
+	if metadata.RequireAllDemands {
 		return countDemands == len(demandsInJob) && countDemands == len(demandsInScaler)
+	} else if metadata.RequireAllDemandsAndIgnoreOthers {
+		return countDemands == len(demandsInScaler)
 	}
 	return countDemands == len(demandsInJob)
 }
@@ -485,7 +545,7 @@ func getCanAgentParentFulfilJob(jr JobRequest, metadata *azurePipelinesMetadata)
 	}
 
 	for _, m := range *matchedAgents {
-		if metadata.parent == m.Name {
+		if metadata.Parent == m.Name {
 			return true
 		}
 	}
@@ -495,9 +555,9 @@ func getCanAgentParentFulfilJob(jr JobRequest, metadata *azurePipelinesMetadata)
 func (s *azurePipelinesScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("azure-pipelines-%d", s.metadata.poolID))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("azure-pipelines-%d", s.metadata.PoolID))),
 		},
-		Target: GetMetricTarget(s.metricType, s.metadata.targetPipelinesQueueLength),
+		Target: GetMetricTarget(s.metricType, s.metadata.TargetPipelinesQueueLength),
 	}
 	metricSpec := v2.MetricSpec{External: externalMetric, Type: externalMetricType}
 	return []v2.MetricSpec{metricSpec}
@@ -513,9 +573,12 @@ func (s *azurePipelinesScaler) GetMetricsAndActivity(ctx context.Context, metric
 
 	metric := GenerateMetricInMili(metricName, float64(queueLen))
 
-	return []external_metrics.ExternalMetricValue{metric}, queueLen > s.metadata.activationTargetPipelinesQueueLength, nil
+	return []external_metrics.ExternalMetricValue{metric}, queueLen > s.metadata.ActivationTargetPipelinesQueueLength, nil
 }
 
 func (s *azurePipelinesScaler) Close(context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }

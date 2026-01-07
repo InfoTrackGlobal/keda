@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/kedacore/keda/v2/tests/helper"
@@ -91,7 +92,7 @@ spec:
       namespace: {{.Namespace}}
     spec:
       containers:
-      - image: rabbitmq:3-management
+      - image: rabbitmq:3.12-management
         name: rabbitmq
         volumeMounts:
           - mountPath: /etc/rabbitmq
@@ -165,7 +166,50 @@ spec:
         - secretRef:
             name: {{.SecretName}}
 `
+
+	RMQTargetDeploymentWithAuthEnvTemplate = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{.SecretName}}
+  namespace: {{.TestNamespace}}
+data:
+  RabbitApiHost: {{.Base64Connection}}
+  RabbitUsername: {{.Base64Username}}
+  RabbitPassword: {{.Base64Password}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{.DeploymentName}}
+  namespace: {{.TestNamespace}}
+  labels:
+    app: {{.DeploymentName}}
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: {{.DeploymentName}}
+  template:
+    metadata:
+      labels:
+        app: {{.DeploymentName}}
+    spec:
+      containers:
+      - name: rabbitmq-consumer
+        image: ghcr.io/kedacore/tests-rabbitmq
+        imagePullPolicy: Always
+        command:
+          - receive
+        args:
+          - '{{.Connection}}'
+        envFrom:
+        - secretRef:
+            name: {{.SecretName}}
+`
 )
+
+const RabbitServerName string = "rabbitmq"
 
 type RabbitOAuthConfig struct {
 	Enable    bool
@@ -216,6 +260,8 @@ func RMQInstall(t *testing.T, kc *kubernetes.Clientset, namespace, user, passwor
 	}
 
 	helper.KubectlApplyWithTemplate(t, data, "rmqDeploymentTemplate", deploymentTemplate)
+	require.True(t, helper.WaitForDeploymentReplicaReadyCount(t, kc, RabbitServerName, namespace, 1, 180, 1),
+		"replica count should be 1 after 3 minute")
 }
 
 func RMQUninstall(t *testing.T, namespace, user, password, vhost string, oauth RabbitOAuthConfig) {

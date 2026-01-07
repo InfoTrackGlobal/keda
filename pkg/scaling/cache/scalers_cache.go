@@ -19,8 +19,10 @@ package cache
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/expr-lang/expr/vm"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/metrics/pkg/apis/external_metrics"
@@ -28,6 +30,7 @@ import (
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/scalers"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 var log = logf.Log.WithName("scalers_cache")
@@ -37,18 +40,23 @@ type ScalersCache struct {
 	Scalers                  []ScalerBuilder
 	ScalableObjectGeneration int64
 	Recorder                 record.EventRecorder
+	CompiledFormula          *vm.Program
+	mutex                    sync.RWMutex
 }
 
 type ScalerBuilder struct {
 	Scaler       scalers.Scaler
-	ScalerConfig scalers.ScalerConfig
-	Factory      func() (scalers.Scaler, *scalers.ScalerConfig, error)
+	ScalerConfig scalersconfig.ScalerConfig
+	Factory      func() (scalers.Scaler, *scalersconfig.ScalerConfig, error)
 }
 
 // GetScalers returns array of scalers and scaler config stored in the cache
-func (c *ScalersCache) GetScalers() ([]scalers.Scaler, []scalers.ScalerConfig) {
+func (c *ScalersCache) GetScalers() ([]scalers.Scaler, []scalersconfig.ScalerConfig) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	scalersList := make([]scalers.Scaler, 0, len(c.Scalers))
-	configsList := make([]scalers.ScalerConfig, 0, len(c.Scalers))
+	configsList := make([]scalersconfig.ScalerConfig, 0, len(c.Scalers))
 	for _, s := range c.Scalers {
 		scalersList = append(scalersList, s.Scaler)
 		configsList = append(configsList, s.ScalerConfig)
@@ -57,8 +65,22 @@ func (c *ScalersCache) GetScalers() ([]scalers.Scaler, []scalers.ScalerConfig) {
 	return scalersList, configsList
 }
 
-// GetPushScaler returns array of push scalers stored in the cache
+// getScalerBuilder returns a ScalerBuilder stored in the cache
+func (c *ScalersCache) getScalerBuilder(index int) (ScalerBuilder, error) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	if index < 0 || index >= len(c.Scalers) {
+		return ScalerBuilder{}, fmt.Errorf("scaler with id %d not found. Len = %d", index, len(c.Scalers))
+	}
+
+	return c.Scalers[index], nil
+}
+
+// GetPushScalers returns array of push scalers stored in the cache
 func (c *ScalersCache) GetPushScalers() []scalers.PushScaler {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 	var result []scalers.PushScaler
 	for _, s := range c.Scalers {
 		if ps, ok := s.Scaler.(scalers.PushScaler); ok {
@@ -70,8 +92,10 @@ func (c *ScalersCache) GetPushScalers() []scalers.PushScaler {
 
 // Close closes all scalers in the cache
 func (c *ScalersCache) Close(ctx context.Context) {
+	c.mutex.Lock()
 	scalers := c.Scalers
 	c.Scalers = nil
+	c.mutex.Unlock()
 	for _, s := range scalers {
 		err := s.Scaler.Close(ctx)
 		if err != nil {
@@ -82,6 +106,8 @@ func (c *ScalersCache) Close(ctx context.Context) {
 
 // GetMetricSpecForScaling returns metrics specs for all scalers in the cache
 func (c *ScalersCache) GetMetricSpecForScaling(ctx context.Context) []v2.MetricSpec {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 	var spec []v2.MetricSpec
 	for _, s := range c.Scalers {
 		spec = append(spec, s.Scaler.GetMetricSpecForScaling(ctx)...)
@@ -93,12 +119,12 @@ func (c *ScalersCache) GetMetricSpecForScaling(ctx context.Context) []v2.MetricS
 func (c *ScalersCache) GetMetricSpecForScalingForScaler(ctx context.Context, index int) ([]v2.MetricSpec, error) {
 	var err error
 
-	scalersList, _ := c.GetScalers()
-	if index < 0 || index >= len(scalersList) {
-		return nil, fmt.Errorf("scaler with id %d not found. Len = %d", index, len(c.Scalers))
+	sb, err := c.getScalerBuilder(index)
+	if err != nil {
+		return nil, err
 	}
 
-	metricSpecs := scalersList[index].GetMetricSpecForScaling(ctx)
+	metricSpecs := sb.Scaler.GetMetricSpecForScaling(ctx)
 
 	// no metric spec returned for a scaler -> this could signal error during connection to the scaler
 	// usually in case this is an external scaler
@@ -119,14 +145,15 @@ func (c *ScalersCache) GetMetricSpecForScalingForScaler(ctx context.Context, ind
 
 // GetMetricsAndActivityForScaler returns metric value, activity and latency for a scaler identified by the metric name
 // and by the input index (from the list of scalers in this ScaledObject)
-func (c *ScalersCache) GetMetricsAndActivityForScaler(ctx context.Context, index int, metricName string) ([]external_metrics.ExternalMetricValue, bool, int64, error) {
-	if index < 0 || index >= len(c.Scalers) {
-		return nil, false, -1, fmt.Errorf("scaler with id %d not found. Len = %d", index, len(c.Scalers))
+func (c *ScalersCache) GetMetricsAndActivityForScaler(ctx context.Context, index int, metricName string) ([]external_metrics.ExternalMetricValue, bool, time.Duration, error) {
+	sb, err := c.getScalerBuilder(index)
+	if err != nil {
+		return nil, false, -1, err
 	}
 	startTime := time.Now()
-	metric, activity, err := c.Scalers[index].Scaler.GetMetricsAndActivity(ctx, metricName)
+	metric, activity, err := sb.Scaler.GetMetricsAndActivity(ctx, metricName)
 	if err == nil {
-		return metric, activity, time.Since(startTime).Milliseconds(), nil
+		return metric, activity, time.Since(startTime), nil
 	}
 
 	ns, err := c.refreshScaler(ctx, index)
@@ -135,29 +162,31 @@ func (c *ScalersCache) GetMetricsAndActivityForScaler(ctx context.Context, index
 	}
 	startTime = time.Now()
 	metric, activity, err = ns.GetMetricsAndActivity(ctx, metricName)
-	return metric, activity, time.Since(startTime).Milliseconds(), err
+	return metric, activity, time.Since(startTime), err
 }
 
-func (c *ScalersCache) refreshScaler(ctx context.Context, id int) (scalers.Scaler, error) {
-	if id < 0 || id >= len(c.Scalers) {
-		return nil, fmt.Errorf("scaler with id %d not found, len = %d, cache has been probably already invalidated", id, len(c.Scalers))
+func (c *ScalersCache) refreshScaler(ctx context.Context, index int) (scalers.Scaler, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if index < 0 || index >= len(c.Scalers) {
+		return nil, fmt.Errorf("scaler with id %d not found. Len = %d", index, len(c.Scalers))
 	}
 
-	sb := c.Scalers[id]
-	defer sb.Scaler.Close(ctx)
-	ns, sConfig, err := sb.Factory()
+	oldSb := c.Scalers[index]
+
+	newScaler, sConfig, err := oldSb.Factory()
 	if err != nil {
 		return nil, err
 	}
 
-	if id < 0 || id >= len(c.Scalers) {
-		return nil, fmt.Errorf("scaler with id %d not found, len = %d, cache has been probably already invalidated", id, len(c.Scalers))
-	}
-	c.Scalers[id] = ScalerBuilder{
-		Scaler:       ns,
+	c.Scalers[index] = ScalerBuilder{
+		Scaler:       newScaler,
 		ScalerConfig: *sConfig,
-		Factory:      sb.Factory,
+		Factory:      oldSb.Factory,
 	}
 
-	return ns, nil
+	oldSb.Scaler.Close(ctx)
+
+	return newScaler, nil
 }

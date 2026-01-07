@@ -5,7 +5,7 @@
 **Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
 
 - [Building](#building)
-  - [Quick start with Visual Studio Code Remote - Containers](#quick-start-with-visual-studio-code-remote---containers)
+  - [Quick start with Visual Studio Code Dev Containers](#quick-start-with-visual-studio-code-dev-containers)
   - [Locally directly](#locally-directly)
 - [Deploying](#deploying)
   - [Custom KEDA locally outside cluster](#custom-keda-locally-outside-cluster)
@@ -25,14 +25,14 @@
 
 ## Building
 
-### Quick start with [Visual Studio Code Remote - Containers](https://code.visualstudio.com/docs/remote/containers)
+### Quick start with [Visual Studio Code Dev Containers](https://code.visualstudio.com/docs/remote/containers)
 
 This helps you pull and build quickly - dev containers launch the project inside a container with all the tooling
 required for a consistent and seamless developer experience.
 
 This means you don't have to install and configure your dev environment as the container handles this for you.
 
-To get started install [VSCode](https://code.visualstudio.com/) and the [Remote Containers extensions](
+To get started install [VSCode](https://code.visualstudio.com/) and the [Dev Containers extensions](
 https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
 
 Clone the repo and launch code:
@@ -43,7 +43,7 @@ cd keda
 code .
 ```
 
-Once VSCode launches run `CTRL+SHIFT+P -> Remote-Containers: Reopen in container` and then use the integrated
+Once VSCode launches run `CTRL+SHIFT+P -> Dev Containers: Reopen in container` and then use the integrated
 terminal to run:
 
 ```bash
@@ -135,7 +135,7 @@ All components inspect the folder `/certs` for any certificates inside it. Argum
 
 ```bash
 mkdir -p /certs
-openssl req -newkey rsa:2048 -subj '/CN=localhost' -nodes -keyout /certs/tls.key -x509 -days 3650 -out /certs/tls.crt
+openssl req -newkey rsa:2048 -subj '/CN=localhost' -addext "subjectAltName = DNS:localhost" -nodes -keyout /certs/tls.key -x509 -days 3650 -out /certs/tls.crt
 cp /certs/tls.crt /certs/ca.crt
 ```
 
@@ -268,7 +268,7 @@ Follow these instructions if you want to debug the KEDA webhook using VS Code.
    Refer to [this](https://code.visualstudio.com/docs/editor/debugging) for more information about debugging with VS Code.
 2. Expose your local instance to internet. If you can't expose it directly, you can use something like [localtunnel](https://theboroer.github.io/localtunnel-www/) using the command `lt --port 9443 --local-https --allow-invalid-cert` after installing the tool.
 
-3. Update the `admissing_webhooks.yaml` in `config/webhooks`, replacing the section (but not commiting this change)
+3. Update the `admissing_webhooks.yaml` in `config/webhooks`, replacing the section (but not committing this change)
    ```yaml
    webhooks:
    - admissionReviewVersions:

@@ -9,20 +9,23 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/oauth2/clientcredentials"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 type pulsarScaler struct {
-	metadata pulsarMetadata
-	client   *http.Client
-	logger   logr.Logger
+	metadata   pulsarMetadata
+	httpClient *http.Client
+	logger     logr.Logger
 }
 
 type pulsarMetadata struct {
@@ -34,13 +37,12 @@ type pulsarMetadata struct {
 
 	pulsarAuth *authentication.AuthMeta
 
-	statsURL    string
-	metricName  string
-	scalerIndex int
+	statsURL     string
+	metricName   string
+	triggerIndex int
 }
 
 const (
-	msgBacklogMetricName       = "msgBacklog"
 	pulsarMetricType           = "External"
 	defaultMsgBacklogThreshold = 10
 	enable                     = "enable"
@@ -94,7 +96,7 @@ type pulsarStats struct {
 }
 
 // NewPulsarScaler creates a new PulsarScaler
-func NewPulsarScaler(config *ScalerConfig) (Scaler, error) {
+func NewPulsarScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	logger := InitializeLogger(config, "pulsar_scaler")
 	pulsarMetadata, err := parsePulsarMetadata(config, logger)
 	if err != nil {
@@ -124,13 +126,13 @@ func NewPulsarScaler(config *ScalerConfig) (Scaler, error) {
 	}
 
 	return &pulsarScaler{
-		client:   client,
-		metadata: pulsarMetadata,
-		logger:   logger,
+		httpClient: client,
+		metadata:   pulsarMetadata,
+		logger:     logger,
 	}, nil
 }
 
-func parsePulsarMetadata(config *ScalerConfig, logger logr.Logger) (pulsarMetadata, error) {
+func parsePulsarMetadata(config *scalersconfig.ScalerConfig, _ logr.Logger) (pulsarMetadata, error) {
 	meta := pulsarMetadata{}
 	switch {
 	case config.TriggerMetadata["adminURLFromEnv"] != "":
@@ -179,23 +181,13 @@ func parsePulsarMetadata(config *ScalerConfig, logger logr.Logger) (pulsarMetada
 
 	meta.msgBacklogThreshold = defaultMsgBacklogThreshold
 
-	// FIXME: msgBacklog support DEPRECATED to be removed in v2.14
-	fmt.Println(config.TriggerMetadata)
-	if val, ok := config.TriggerMetadata[msgBacklogMetricName]; ok {
-		logger.V(1).Info("\"msgBacklog\" is deprecated and will be removed in v2.14, please use \"msgBacklogThreshold\" instead")
+	if val, ok := config.TriggerMetadata["msgBacklogThreshold"]; ok {
 		t, err := strconv.ParseInt(val, 10, 64)
 		if err != nil {
-			return meta, fmt.Errorf("error parsing %s: %w", msgBacklogMetricName, err)
-		}
-		meta.msgBacklogThreshold = t
-	} else if val, ok := config.TriggerMetadata["msgBacklogThreshold"]; ok {
-		t, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return meta, fmt.Errorf("error parsing %s: %w", msgBacklogMetricName, err)
+			return meta, fmt.Errorf("error parsing %s: %w", "msgBacklogThreshold", err)
 		}
 		meta.msgBacklogThreshold = t
 	}
-	// END FIXME
 
 	// For backwards compatibility, we need to map "tls: enable" to
 	if tls, ok := config.TriggerMetadata["tls"]; ok {
@@ -209,10 +201,34 @@ func parsePulsarMetadata(config *ScalerConfig, logger logr.Logger) (pulsarMetada
 	}
 	auth, err := authentication.GetAuthConfigs(config.TriggerMetadata, config.AuthParams)
 	if err != nil {
-		return meta, fmt.Errorf("error parsing %s: %w", msgBacklogMetricName, err)
+		return meta, fmt.Errorf("error parsing %s: %w", "msgBacklogThreshold", err)
+	}
+
+	if auth != nil && auth.EnableOAuth {
+		if auth.OauthTokenURI == "" {
+			auth.OauthTokenURI = config.TriggerMetadata["oauthTokenURI"]
+		}
+		if auth.Scopes == nil {
+			auth.Scopes = authentication.ParseScope(config.TriggerMetadata["scope"])
+		}
+		if auth.ClientID == "" {
+			auth.ClientID = config.TriggerMetadata["clientID"]
+		}
+		// client_secret is not required for mtls OAuth(RFC8705)
+		// set secret to random string to work around the Go OAuth lib
+		if auth.ClientSecret == "" {
+			auth.ClientSecret = time.Now().String()
+		}
+		if auth.EndpointParams == nil {
+			v, err := authentication.ParseEndpointParams(config.TriggerMetadata["EndpointParams"])
+			if err != nil {
+				return meta, fmt.Errorf("error parsing EndpointParams: %s", config.TriggerMetadata["EndpointParams"])
+			}
+			auth.EndpointParams = v
+		}
 	}
 	meta.pulsarAuth = auth
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 	return meta, nil
 }
 
@@ -224,9 +240,20 @@ func (s *pulsarScaler) GetStats(ctx context.Context) (*pulsarStats, error) {
 		return nil, fmt.Errorf("error requesting stats from admin url: %w", err)
 	}
 
+	client := s.httpClient
+	if s.metadata.pulsarAuth != nil && s.metadata.pulsarAuth.EnableOAuth {
+		config := clientcredentials.Config{
+			ClientID:       s.metadata.pulsarAuth.ClientID,
+			ClientSecret:   s.metadata.pulsarAuth.ClientSecret,
+			TokenURL:       s.metadata.pulsarAuth.OauthTokenURI,
+			Scopes:         s.metadata.pulsarAuth.Scopes,
+			EndpointParams: s.metadata.pulsarAuth.EndpointParams,
+		}
+		client = config.Client(context.Background())
+	}
 	addAuthHeaders(req, &s.metadata)
 
-	res, err := s.client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("error requesting stats from admin url: %w", err)
 	}
@@ -269,7 +296,7 @@ func (s *pulsarScaler) getMsgBackLog(ctx context.Context) (int64, bool, error) {
 	return v.Msgbacklog, found, nil
 }
 
-// GetGetMetricsAndActivityMetrics returns value for a supported metric and an error if there is a problem getting the metric
+// GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
 func (s *pulsarScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	msgBacklog, found, err := s.getMsgBackLog(ctx)
 	if err != nil {
@@ -290,7 +317,7 @@ func (s *pulsarScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec 
 
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(s.metadata.metricName)),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(s.metadata.metricName)),
 		},
 		Target: v2.MetricTarget{
 			Type:         v2.AverageValueMetricType,
@@ -302,7 +329,9 @@ func (s *pulsarScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec 
 }
 
 func (s *pulsarScaler) Close(context.Context) error {
-	s.client = nil
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }
 

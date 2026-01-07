@@ -147,7 +147,7 @@ metadata:
   name: {{.JobName}}
   namespace: {{.TestNamespace}}
 spec:
-  ttlSecondsAfterFinished: 0
+  ttlSecondsAfterFinished: 30
   template:
     spec:
       containers:
@@ -175,12 +175,16 @@ spec:
 func TestScaler(t *testing.T) {
 	// Create kubernetes resources for PostgreSQL server
 	kc := GetKubernetesClient(t)
+	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		redis.RemoveStandalone(t, testName, redisNamespace)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
 
 	// Create Redis Standalone
 	redis.InstallStandalone(t, kc, testName, redisNamespace, redisPassword)
 
 	// Create kubernetes resources for testing
-	data, templates := getTemplateData()
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 0, 60, 3),
@@ -197,15 +201,11 @@ func TestScaler(t *testing.T) {
 
 	t.Log("--- testing scale in ---")
 	testScaleIn(t, kc, minReplicaCount)
-
-	// cleanup
-	redis.RemoveStandalone(t, testName, redisNamespace)
-	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData, numMessages int, maxReplicas int) {
 	data.ItemsToWrite = numMessages
-	KubectlApplyWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicas, 60, 1),
 		"replica count should be %d after 3 minutes", maxReplicaCount)
@@ -218,7 +218,7 @@ func testScaleIn(t *testing.T, kc *kubernetes.Clientset, minReplicas int) {
 
 func testActivationValue(t *testing.T, kc *kubernetes.Clientset, data templateData, numMessages int) {
 	data.ItemsToWrite = numMessages
-	KubectlApplyWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, 0, 30)
 }

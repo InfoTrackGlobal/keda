@@ -49,6 +49,9 @@ type ClientOptions struct {
 	// Application ID that will be passed to the namespace.
 	ApplicationID string
 
+	// A custom endpoint address that can be used when establishing the connection to the service.
+	CustomEndpoint string
+
 	// NewWebSocketConn is a function that can create a net.Conn for use with websockets.
 	// For an example, see ExampleNewClient_usingWebsockets() function in example_client_test.go.
 	NewWebSocketConn func(ctx context.Context, args NewWebSocketConnArgs) (net.Conn, error)
@@ -160,6 +163,10 @@ func newClientImpl(creds clientCreds, args clientImplArgs) (*Client, error) {
 			nsOptions = append(nsOptions, internal.NamespaceWithUserAgent(args.ClientOptions.ApplicationID))
 		}
 
+		if args.ClientOptions.CustomEndpoint != "" {
+			nsOptions = append(nsOptions, internal.NamespaceWithCustomEndpoint(args.ClientOptions.CustomEndpoint))
+		}
+
 		nsOptions = append(nsOptions, internal.NamespaceWithRetryOptions(args.ClientOptions.RetryOptions))
 	}
 
@@ -232,7 +239,7 @@ func (client *Client) NewSender(queueOrTopic string, options *NewSenderOptions) 
 
 // AcceptSessionForQueue accepts a session from a queue with a specific session ID.
 // NOTE: this receiver is initialized immediately, not lazily.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (client *Client) AcceptSessionForQueue(ctx context.Context, queueName string, sessionID string, options *SessionReceiverOptions) (*SessionReceiver, error) {
 	id, cleanupOnClose := client.getCleanupForCloseable()
 	sessionReceiver, err := newSessionReceiver(
@@ -259,7 +266,7 @@ func (client *Client) AcceptSessionForQueue(ctx context.Context, queueName strin
 
 // AcceptSessionForSubscription accepts a session from a subscription with a specific session ID.
 // NOTE: this receiver is initialized immediately, not lazily.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (client *Client) AcceptSessionForSubscription(ctx context.Context, topicName string, subscriptionName string, sessionID string, options *SessionReceiverOptions) (*SessionReceiver, error) {
 	id, cleanupOnClose := client.getCleanupForCloseable()
 	sessionReceiver, err := newSessionReceiver(

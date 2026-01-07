@@ -22,14 +22,21 @@ import (
 	"github.com/google/cel-go/common/types/ref"
 )
 
+// Error interface which allows types types.Err values to be treated as error values.
+type Error interface {
+	error
+	ref.Val
+}
+
 // Err type which extends the built-in go error and implements ref.Val.
 type Err struct {
 	error
+	id int64
 }
 
 var (
 	// ErrType singleton.
-	ErrType = NewTypeValue("error")
+	ErrType = NewOpaqueType("error")
 
 	// errDivideByZero is an error indicating a division by zero of an integer value.
 	errDivideByZero = errors.New("division by zero")
@@ -52,7 +59,24 @@ var (
 // NewErr creates a new Err described by the format string and args.
 // TODO: Audit the use of this function and standardize the error messages and codes.
 func NewErr(format string, args ...any) ref.Val {
-	return &Err{fmt.Errorf(format, args...)}
+	return &Err{error: fmt.Errorf(format, args...)}
+}
+
+// NewErrWithNodeID creates a new Err described by the format string and args.
+// TODO: Audit the use of this function and standardize the error messages and codes.
+func NewErrWithNodeID(id int64, format string, args ...any) ref.Val {
+	return &Err{error: fmt.Errorf(format, args...), id: id}
+}
+
+// LabelErrNode returns val unaltered it is not an Err or if the error has a non-zero
+// AST node ID already present. Otherwise the id is added to the error for
+// recovery with the Err.NodeID method.
+func LabelErrNode(id int64, val ref.Val) ref.Val {
+	if err, ok := val.(*Err); ok && err.id == 0 {
+		err.id = id
+		return err
+	}
+	return val
 }
 
 // NoSuchOverloadErr returns a new types.Err instance with a no such overload message.
@@ -81,8 +105,8 @@ func ValOrErr(val ref.Val, format string, args ...any) ref.Val {
 	return val
 }
 
-// wrapErr wraps an existing Go error value into a CEL Err value.
-func wrapErr(err error) ref.Val {
+// WrapErr wraps an existing Go error value into a CEL Err value.
+func WrapErr(err error) ref.Val {
 	return &Err{error: err}
 }
 
@@ -118,9 +142,19 @@ func (e *Err) Value() any {
 	return e.error
 }
 
+// NodeID returns the AST node ID of the expression that returned the error.
+func (e *Err) NodeID() int64 {
+	return e.id
+}
+
 // Is implements errors.Is.
 func (e *Err) Is(target error) bool {
 	return e.error.Error() == target.Error()
+}
+
+// Unwrap implements errors.Unwrap.
+func (e *Err) Unwrap() error {
+	return e.error
 }
 
 // IsError returns whether the input element ref.Type or ref.Val is equal to

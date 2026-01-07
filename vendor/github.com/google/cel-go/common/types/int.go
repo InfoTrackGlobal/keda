@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
 
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -41,16 +40,6 @@ const (
 )
 
 var (
-	// IntType singleton.
-	IntType = NewTypeValue("int",
-		traits.AdderType,
-		traits.ComparerType,
-		traits.DividerType,
-		traits.ModderType,
-		traits.MultiplierType,
-		traits.NegatorType,
-		traits.SubtractorType)
-
 	// int32WrapperType reflected type for protobuf int32 wrapper type.
 	int32WrapperType = reflect.TypeOf(&wrapperspb.Int32Value{})
 
@@ -66,7 +55,7 @@ func (i Int) Add(other ref.Val) ref.Val {
 	}
 	val, err := addInt64Checked(int64(i), int64(otherInt))
 	if err != nil {
-		return wrapErr(err)
+		return WrapErr(err)
 	}
 	return Int(val)
 }
@@ -97,6 +86,18 @@ func (i Int) ConvertToNative(typeDesc reflect.Type) (any, error) {
 		// the net effect with respect to proto-assignment is handled correctly by the reflection
 		// Convert method.
 		v, err := int64ToInt32Checked(int64(i))
+		if err != nil {
+			return nil, err
+		}
+		return reflect.ValueOf(v).Convert(typeDesc).Interface(), nil
+	case reflect.Int8:
+		v, err := int64ToInt8Checked(int64(i))
+		if err != nil {
+			return nil, err
+		}
+		return reflect.ValueOf(v).Convert(typeDesc).Interface(), nil
+	case reflect.Int16:
+		v, err := int64ToInt16Checked(int64(i))
 		if err != nil {
 			return nil, err
 		}
@@ -176,7 +177,7 @@ func (i Int) ConvertToType(typeVal ref.Type) ref.Val {
 	case UintType:
 		u, err := int64ToUint64Checked(int64(i))
 		if err != nil {
-			return wrapErr(err)
+			return WrapErr(err)
 		}
 		return Uint(u)
 	case DoubleType:
@@ -204,7 +205,7 @@ func (i Int) Divide(other ref.Val) ref.Val {
 	}
 	val, err := divideInt64Checked(int64(i), int64(otherInt))
 	if err != nil {
-		return wrapErr(err)
+		return WrapErr(err)
 	}
 	return Int(val)
 }
@@ -239,7 +240,7 @@ func (i Int) Modulo(other ref.Val) ref.Val {
 	}
 	val, err := moduloInt64Checked(int64(i), int64(otherInt))
 	if err != nil {
-		return wrapErr(err)
+		return WrapErr(err)
 	}
 	return Int(val)
 }
@@ -252,7 +253,7 @@ func (i Int) Multiply(other ref.Val) ref.Val {
 	}
 	val, err := multiplyInt64Checked(int64(i), int64(otherInt))
 	if err != nil {
-		return wrapErr(err)
+		return WrapErr(err)
 	}
 	return Int(val)
 }
@@ -261,7 +262,7 @@ func (i Int) Multiply(other ref.Val) ref.Val {
 func (i Int) Negate() ref.Val {
 	val, err := negateInt64Checked(int64(i))
 	if err != nil {
-		return wrapErr(err)
+		return WrapErr(err)
 	}
 	return Int(val)
 }
@@ -274,7 +275,7 @@ func (i Int) Subtract(subtrahend ref.Val) ref.Val {
 	}
 	val, err := subtractInt64Checked(int64(i), int64(subtraInt))
 	if err != nil {
-		return wrapErr(err)
+		return WrapErr(err)
 	}
 	return Int(val)
 }

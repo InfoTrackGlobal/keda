@@ -1,10 +1,91 @@
 # Release History
 
+## 1.8.0 (2025-02-11)
+
+### Features Added
+
+- ServiceBusClient allows the endpoint to be overridden with ServiceBusClientOptions.CustomEndpoint, to use TCP proxies with AMQP. (PR#23843)
+
+## 1.8.0-beta.2 (2025-01-14)
+
+### Features Added
+
+- ServiceBusClient allows the endpoint to be overridden with ServiceBusClientOptions.CustomEndpoint, to use TCP proxies with AMQP. (PR#23843)
+
+### Bugs Fixed
+
+- Receivers had a bug where a message could be received but not returned to the user. Callers would see that, occasionally, a message would not be returned from ReceiveMessages(), but would appear to have been received. Thanks to @patrickwhite256 for reporting this issue. (PR#23929)
+
+## 1.7.4 (2025-01-13)
+
+### Bugs Fixed
+
+- Receivers had a bug where a message could be received but not returned to the user. Callers would see that, occasionally, a message would not be returned from ReceiveMessages(), but would appear to have been received. Thanks to @patrickwhite256 for reporting this issue. (PR#23929)
+
+## 1.7.3 (2024-10-14)
+
+### Bugs Fixed
+
+- Apply fix from @bcho for overflows with retries. (PR#23562)
+
+## 1.7.2 (2024-09-11)
+
+### Bugs Fixed
+
+- Fixed a bug where cancelling RenewMessageLock() calls could cause hangs in future RenewMessageLock calls. (PR#23400)
+
+## 1.7.1 (2024-05-20)
+
+### Bugs Fixed
+
+- Emulator strings should allow for hosts other than localhost (PR#22898)
+
+## 1.7.0 (2024-04-02)
+
+### Features Added
+
+- Add in ability to handle emulator connection strings. (PR#22663)
+
+## 1.6.1 (2024-03-05)
+
+### Bugs Fixed
+
+- Fixed case where closing a Receiver/Sender after an idle period would take > 20 seconds. (PR#22509)
+- Fixed a potential memory leak when receiving a message on one receiver and attempting to settle with another. (PR#22431)
+
+## 1.6.0 (2024-01-17)
+
+### Features Added
+
+- ReceiverOptions.TimeAfterFirstMessage lets you configure the amount of time, after the first message in a batch is received, before we return messages. (PR#22154)
+
+### Bugs Fixed
+
+- Settling a message (using CompleteMessage, AbandonMessage, etc..) on a different Receiver instance than you received on no
+  longer leaks memory. (PR#22253)
+
+## 1.5.0 (2023-10-10)
+
+### Features Added
+
+- Added `(Queue|Subscription|Topic)Name` fields to appropriate responses in the `admin.Client`. PR#21632
+
+## 1.4.1 (2023-09-12)
+
+### Features Added
+
+- `ReceivedMessage` can be converted to a `Message` for easier re-sending, using `ReceivedMessage.Message()`. PR#21472
+
+### Bugs Fixed
+
+- admin.Client properly populates the request body when retrying operations. PR#21496
+- Senders could potentially hang forever on SendMessage() calls due to a race condition. Fixed by upgrading to go-amqp v1.0.2. PR#21465
+
 ## 1.4.0 (2023-06-06)
 
 ### Features Added
 
-- `admin.SubscriptionProperties` now allow for a `DefaultRule` to be set. This allows Subscriptions to be created with an immediate filter/action. 
+- `admin.SubscriptionProperties` now allow for a `DefaultRule` to be set. This allows Subscriptions to be created with an immediate filter/action.
   Contributed by @StrawbrryFlurry. (PR#20888)
 
 ## 1.3.0 (2023-05-09)

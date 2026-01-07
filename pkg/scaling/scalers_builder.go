@@ -27,6 +27,7 @@ import (
 	"github.com/kedacore/keda/v2/pkg/common/message"
 	"github.com/kedacore/keda/v2/pkg/eventreason"
 	"github.com/kedacore/keda/v2/pkg/scalers"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	"github.com/kedacore/keda/v2/pkg/scaling/cache"
 	"github.com/kedacore/keda/v2/pkg/scaling/resolver"
 )
@@ -36,7 +37,7 @@ import (
 /// --------------------------------------------------------------------------- ///
 
 // buildScalers returns list of Scalers for the specified triggers
-func (h *scaleHandler) buildScalers(ctx context.Context, withTriggers *kedav1alpha1.WithTriggers, podTemplateSpec *corev1.PodTemplateSpec, containerName string) ([]cache.ScalerBuilder, error) {
+func (h *scaleHandler) buildScalers(ctx context.Context, withTriggers *kedav1alpha1.WithTriggers, podTemplateSpec *corev1.PodTemplateSpec, containerName string, asMetricSource bool) ([]cache.ScalerBuilder, error) {
 	logger := log.WithValues("type", withTriggers.Kind, "namespace", withTriggers.Namespace, "name", withTriggers.Name)
 	var err error
 	resolvedEnv := make(map[string]string)
@@ -45,28 +46,40 @@ func (h *scaleHandler) buildScalers(ctx context.Context, withTriggers *kedav1alp
 	for i, t := range withTriggers.Spec.Triggers {
 		triggerIndex, trigger := i, t
 
-		factory := func() (scalers.Scaler, *scalers.ScalerConfig, error) {
+		factory := func() (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
 			if podTemplateSpec != nil {
-				resolvedEnv, err = resolver.ResolveContainerEnv(ctx, h.client, logger, &podTemplateSpec.Spec, containerName, withTriggers.Namespace, h.secretsLister)
+				resolvedEnv, err = resolver.ResolveContainerEnv(ctx, h.client, logger, &podTemplateSpec.Spec, containerName, withTriggers.Namespace, h.authClientSet.SecretLister)
 				if err != nil {
 					return nil, nil, fmt.Errorf("error resolving secrets for ScaleTarget: %w", err)
 				}
 			}
-			config := &scalers.ScalerConfig{
+			config := &scalersconfig.ScalerConfig{
 				ScalableObjectName:      withTriggers.Name,
 				ScalableObjectNamespace: withTriggers.Namespace,
 				ScalableObjectType:      withTriggers.Kind,
 				TriggerName:             trigger.Name,
 				TriggerMetadata:         trigger.Metadata,
+				TriggerType:             trigger.Type,
 				TriggerUseCachedMetrics: trigger.UseCachedMetrics,
 				ResolvedEnv:             resolvedEnv,
 				AuthParams:              make(map[string]string),
 				GlobalHTTPTimeout:       h.globalHTTPTimeout,
-				ScalerIndex:             triggerIndex,
+				TriggerIndex:            triggerIndex,
 				MetricType:              trigger.MetricType,
+				AsMetricSource:          asMetricSource,
+				ScaledObject:            withTriggers,
+				Recorder:                h.recorder,
+				TriggerUniqueKey:        fmt.Sprintf("%s-%s-%s-%d", withTriggers.Kind, withTriggers.Namespace, withTriggers.Name, triggerIndex),
 			}
 
-			authParams, podIdentity, err := resolver.ResolveAuthRefAndPodIdentity(ctx, h.client, logger, trigger.AuthenticationRef, podTemplateSpec, withTriggers.Namespace, h.secretsLister)
+			authParams, podIdentity, err := resolver.ResolveAuthRefAndPodIdentity(ctx, h.client, logger, trigger.AuthenticationRef, podTemplateSpec, withTriggers.Namespace, h.authClientSet)
+			switch podIdentity.Provider {
+			case kedav1alpha1.PodIdentityProviderAwsEKS:
+				// FIXME: Delete this for v3
+				logger.Info("WARNING: AWS EKS Identity has been deprecated in favor of AWS Identity and will be removed from KEDA on v3")
+			default:
+			}
+
 			if err != nil {
 				return nil, nil, err
 			}
@@ -76,10 +89,11 @@ func (h *scaleHandler) buildScalers(ctx context.Context, withTriggers *kedav1alp
 			return scaler, config, err
 		}
 
+		// nosemgrep: invalid-usage-of-modified-variable
 		scaler, config, err := factory()
 		if err != nil {
 			h.recorder.Event(withTriggers, corev1.EventTypeWarning, eventreason.KEDAScalerFailed, err.Error())
-			logger.Error(err, "error resolving auth params", "scalerIndex", triggerIndex)
+			logger.Error(err, "error resolving auth params", "triggerIndex", triggerIndex)
 			if scaler != nil {
 				scaler.Close(ctx)
 			}
@@ -102,25 +116,27 @@ func (h *scaleHandler) buildScalers(ctx context.Context, withTriggers *kedav1alp
 }
 
 // buildScaler builds a scaler form input config and trigger type
-func buildScaler(ctx context.Context, client client.Client, triggerType string, config *scalers.ScalerConfig) (scalers.Scaler, error) {
+func buildScaler(ctx context.Context, client client.Client, triggerType string, config *scalersconfig.ScalerConfig) (scalers.Scaler, error) {
 	// TRIGGERS-START
 	switch triggerType {
 	case "activemq":
 		return scalers.NewActiveMQScaler(config)
+	case "apache-kafka":
+		return scalers.NewApacheKafkaScaler(ctx, config)
 	case "arangodb":
 		return scalers.NewArangoDBScaler(config)
 	case "artemis-queue":
 		return scalers.NewArtemisQueueScaler(config)
 	case "aws-cloudwatch":
-		return scalers.NewAwsCloudwatchScaler(config)
+		return scalers.NewAwsCloudwatchScaler(ctx, config)
 	case "aws-dynamodb":
-		return scalers.NewAwsDynamoDBScaler(config)
+		return scalers.NewAwsDynamoDBScaler(ctx, config)
 	case "aws-dynamodb-streams":
 		return scalers.NewAwsDynamoDBStreamsScaler(ctx, config)
 	case "aws-kinesis-stream":
-		return scalers.NewAwsKinesisStreamScaler(config)
+		return scalers.NewAwsKinesisStreamScaler(ctx, config)
 	case "aws-sqs-queue":
-		return scalers.NewAwsSqsQueueScaler(config)
+		return scalers.NewAwsSqsQueueScaler(ctx, config)
 	case "azure-app-insights":
 		return scalers.NewAzureAppInsightsScaler(config)
 	case "azure-blob":
@@ -128,7 +144,7 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 	case "azure-data-explorer":
 		return scalers.NewAzureDataExplorerScaler(config)
 	case "azure-eventhub":
-		return scalers.NewAzureEventHubScaler(ctx, config)
+		return scalers.NewAzureEventHubScaler(config)
 	case "azure-log-analytics":
 		return scalers.NewAzureLogAnalyticsScaler(config)
 	case "azure-monitor":
@@ -139,6 +155,8 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 		return scalers.NewAzureQueueScaler(config)
 	case "azure-servicebus":
 		return scalers.NewAzureServiceBusScaler(ctx, config)
+	case "beanstalkd":
+		return scalers.NewBeanstalkdScaler(config)
 	case "cassandra":
 		return scalers.NewCassandraScaler(config)
 	case "couchdb":
@@ -149,6 +167,8 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 		return scalers.NewCronScaler(config)
 	case "datadog":
 		return scalers.NewDatadogScaler(ctx, config)
+	case "dynatrace":
+		return scalers.NewDynatraceScaler(config)
 	case "elasticsearch":
 		return scalers.NewElasticsearchScaler(config)
 	case "etcd":
@@ -160,6 +180,8 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 		return scalers.NewExternalMockScaler(config)
 	case "external-push":
 		return scalers.NewExternalPushScaler(config)
+	case "gcp-cloudtasks":
+		return scalers.NewGcpCloudTasksScaler(config)
 	case "gcp-pubsub":
 		return scalers.NewPubSubScaler(config)
 	case "gcp-stackdriver":
@@ -177,7 +199,7 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 	case "influxdb":
 		return scalers.NewInfluxDBScaler(config)
 	case "kafka":
-		return scalers.NewKafkaScaler(config)
+		return scalers.NewKafkaScaler(ctx, config)
 	case "kubernetes-workload":
 		return scalers.NewKubernetesWorkloadScaler(client, config)
 	case "liiklus":
@@ -198,12 +220,14 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 		return scalers.NewNATSJetStreamScaler(config)
 	case "new-relic":
 		return scalers.NewNewRelicScaler(config)
+	case "nsq":
+		return scalers.NewNSQScaler(config)
 	case "openstack-metric":
 		return scalers.NewOpenstackMetricScaler(ctx, config)
 	case "openstack-swift":
-		return scalers.NewOpenstackSwiftScaler(ctx, config)
+		return scalers.NewOpenstackSwiftScaler(config)
 	case "postgresql":
-		return scalers.NewPostgreSQLScaler(config)
+		return scalers.NewPostgreSQLScaler(ctx, config)
 	case "predictkube":
 		return scalers.NewPredictKubeScaler(ctx, config)
 	case "prometheus":
@@ -230,8 +254,12 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 		return scalers.NewSolaceScaler(config)
 	case "solr":
 		return scalers.NewSolrScaler(config)
+	case "splunk":
+		return scalers.NewSplunkScaler(config)
 	case "stan":
 		return scalers.NewStanScaler(config)
+	case "temporal":
+		return scalers.NewTemporalScaler(ctx, config)
 	default:
 		return nil, fmt.Errorf("no scaler found for type: %s", triggerType)
 	}

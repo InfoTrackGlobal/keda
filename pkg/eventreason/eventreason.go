@@ -41,6 +41,9 @@ const (
 	// ScaledJobDeleted is for event when ScaledJob is deleted
 	ScaledJobDeleted = "ScaledJobDeleted"
 
+	// KEDAScalersInfo is for event when Scaler has additional info
+	KEDAScalersInfo = "KEDAScalerInfo"
+
 	// KEDAScalersStarted is for event when scalers watch started for ScaledObject or ScaledJob
 	KEDAScalersStarted = "KEDAScalersStarted"
 
@@ -49,6 +52,9 @@ const (
 
 	// KEDAScalerFailed is for event when a scaler fails for a ScaledJob or a ScaledObject
 	KEDAScalerFailed = "KEDAScalerFailed"
+
+	// KEDAMetricSourceFailed is for event when a scaler fails as metric source for custom formula
+	KEDAMetricSourceFailed = "KEDAMetricSourceFailed"
 
 	// KEDAScaleTargetActivated is for event when the scale target of ScaledObject was activated
 	KEDAScaleTargetActivated = "KEDAScaleTargetActivated"
@@ -74,6 +80,9 @@ const (
 	// TriggerAuthenticationFailed is for event when a TriggerAuthentication occurs error
 	TriggerAuthenticationFailed = "TriggerAuthenticationFailed"
 
+	// TriggerAuthenticationUpdated is for event when a TriggerAuthentication is updated
+	TriggerAuthenticationUpdated = "ClusterTriggerAuthenticationUpdated"
+
 	// ClusterTriggerAuthenticationDeleted is for event when a ClusterTriggerAuthentication is deleted
 	ClusterTriggerAuthenticationDeleted = "ClusterTriggerAuthenticationDeleted"
 
@@ -82,4 +91,7 @@ const (
 
 	// ClusterTriggerAuthenticationFailed is for event when a ClusterTriggerAuthentication occurs error
 	ClusterTriggerAuthenticationFailed = "ClusterTriggerAuthenticationFailed"
+
+	// ClusterTriggerAuthenticationUpdated is for event when a ClusterTriggerAuthentication is updated
+	ClusterTriggerAuthenticationUpdated = "ClusterTriggerAuthenticationUpdated"
 )

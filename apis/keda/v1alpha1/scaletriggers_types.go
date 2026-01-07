@@ -18,6 +18,8 @@ package v1alpha1
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 )
@@ -51,6 +53,11 @@ type AuthenticationRef struct {
 // - useCachedMetrics is defined only for a supported triggers
 func ValidateTriggers(triggers []ScaleTriggers) error {
 	triggersCount := len(triggers)
+
+	if triggersCount == 0 {
+		return fmt.Errorf("no triggers defined in the ScaledObject/ScaledJob")
+	}
+
 	if triggers != nil && triggersCount > 0 {
 		triggerNames := make(map[string]bool, triggersCount)
 		for i := 0; i < triggersCount; i++ {
@@ -66,7 +73,7 @@ func ValidateTriggers(triggers []ScaleTriggers) error {
 			if name != "" {
 				if _, found := triggerNames[name]; found {
 					// found duplicate name
-					return fmt.Errorf("triggerName %q is defined multiple times in the ScaledObject, but it must be unique", name)
+					return fmt.Errorf("triggerName %q is defined multiple times in the ScaledObject/ScaledJob, but it must be unique", name)
 				}
 				triggerNames[name] = true
 			}
@@ -74,4 +81,19 @@ func ValidateTriggers(triggers []ScaleTriggers) error {
 	}
 
 	return nil
+}
+
+// CombinedTriggersAndAuthenticationsTypes returns a comma separated string of all trigger types and authentication types
+func CombinedTriggersAndAuthenticationsTypes(triggers []ScaleTriggers) (string, string) {
+	var triggersTypes []string
+	var authTypes []string
+	for _, trigger := range triggers {
+		if !slices.Contains(triggersTypes, trigger.Type) {
+			triggersTypes = append(triggersTypes, trigger.Type)
+		}
+		if trigger.AuthenticationRef != nil && !slices.Contains(authTypes, trigger.AuthenticationRef.Name) {
+			authTypes = append(authTypes, trigger.AuthenticationRef.Name)
+		}
+	}
+	return strings.Join(triggersTypes, ","), strings.Join(authTypes, ",")
 }
