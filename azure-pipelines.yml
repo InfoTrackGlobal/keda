@@ -1,0 +1,124 @@
+# Azure DevOps pipeline for the InfoTrack KEDA fork.
+#
+# Mirrors InfoTrackGlobal/http-add-on's pipeline shape: one stage per image,
+# each stage invokes the shared docker-build/linux-docker-builds.yaml template
+# once per Dockerfile. The template handles buildx, GitVersion, ECR login,
+# cache, and push to the listed countries.
+#
+# KEDA ships three Dockerfiles at repo root, each producing one image:
+#   Dockerfile            -> keda                     (operator/controller)
+#   Dockerfile.adapter    -> keda-metrics-apiserver
+#   Dockerfile.webhooks   -> keda-admission-webhooks
+#
+# The Dockerfiles use ghcr.io/kedacore/keda-tools:<go-version> as the builder
+# stage, so code generation (make generate) and Go compile run INSIDE docker.
+# Agents only need docker + buildx (already provided by AU-k8s-linux pool).
+#
+# AGENT REQUIREMENTS (verified against InfoTrackGlobal/azure.devops.agents):
+#   - Docker + buildx (provided by linux-default / AU-k8s-linux pool)
+#   - Outbound egress to ghcr.io (pulls keda-tools builder image)
+#   - Outbound egress to proxy.golang.org (pulled inside builder if no vendor
+#     cache hit — KEDA vendors dependencies so this should be rare)
+#
+# NOT YET REGISTERED IN ADO. Otis will register this pipeline definition
+# manually after review.
+
+variables:
+  - name: docker_file_operator
+    value: 'Dockerfile'
+  - name: docker_file_adapter
+    value: 'Dockerfile.adapter'
+  - name: docker_file_webhooks
+    value: 'Dockerfile.webhooks'
+  - name: ecr_name_operator
+    value: 'keda'
+  - name: ecr_name_adapter
+    value: 'keda-metrics-apiserver'
+  - name: ecr_name_webhooks
+    value: 'keda-admission-webhooks'
+  - name: repositoryname
+    value: 'keda'
+  - name: agent_pool
+    value: 'AU-k8s-linux'
+  - name: working_directory
+    value: '$(Build.SourcesDirectory)/$(repositoryname)'
+  - group: common
+  - group: AWS-ECR-Credentials
+
+trigger:
+  - main
+pr: none
+
+resources:
+  repositories:
+    - repository: templates
+      type: github
+      name: InfoTrackGlobal/azure.devops.templates
+      endpoint: InfoTrackGlobal
+
+stages:
+  - stage: Build_Operator
+    jobs:
+      - template: docker-build/linux-docker-builds.yaml@templates
+        parameters:
+          agent_pool: $(agent_pool)
+          ca_aws_access_key_id: $(ca_aws_access_key_id)
+          ca_aws_secret_access_key: $(ca_aws_secret_access_key)
+          uk_aws_access_key_id: $(uk_aws_access_key_id)
+          uk_aws_secret_access_key: $(uk_aws_secret_access_key)
+          us_aws_access_key_id: $(us_aws_access_key_id)
+          us_aws_secret_access_key: $(us_aws_secret_access_key)
+          docker_file: $(docker_file_operator)
+          countries:
+            - AU
+            - CA
+            - UK
+            - US
+          build_location: AU
+          working_directory: $(working_directory)
+          ecr_name: $(ecr_name_operator)
+          repositoryname: $(repositoryname)
+
+  - stage: Build_MetricsApiserver
+    jobs:
+      - template: docker-build/linux-docker-builds.yaml@templates
+        parameters:
+          agent_pool: $(agent_pool)
+          ca_aws_access_key_id: $(ca_aws_access_key_id)
+          ca_aws_secret_access_key: $(ca_aws_secret_access_key)
+          uk_aws_access_key_id: $(uk_aws_access_key_id)
+          uk_aws_secret_access_key: $(uk_aws_secret_access_key)
+          us_aws_access_key_id: $(us_aws_access_key_id)
+          us_aws_secret_access_key: $(us_aws_secret_access_key)
+          docker_file: $(docker_file_adapter)
+          countries:
+            - AU
+            - CA
+            - UK
+            - US
+          build_location: AU
+          working_directory: $(working_directory)
+          ecr_name: $(ecr_name_adapter)
+          repositoryname: $(repositoryname)
+
+  - stage: Build_AdmissionWebhooks
+    jobs:
+      - template: docker-build/linux-docker-builds.yaml@templates
+        parameters:
+          agent_pool: $(agent_pool)
+          ca_aws_access_key_id: $(ca_aws_access_key_id)
+          ca_aws_secret_access_key: $(ca_aws_secret_access_key)
+          uk_aws_access_key_id: $(uk_aws_access_key_id)
+          uk_aws_secret_access_key: $(uk_aws_secret_access_key)
+          us_aws_access_key_id: $(us_aws_access_key_id)
+          us_aws_secret_access_key: $(us_aws_secret_access_key)
+          docker_file: $(docker_file_webhooks)
+          countries:
+            - AU
+            - CA
+            - UK
+            - US
+          build_location: AU
+          working_directory: $(working_directory)
+          ecr_name: $(ecr_name_webhooks)
+          repositoryname: $(repositoryname)
