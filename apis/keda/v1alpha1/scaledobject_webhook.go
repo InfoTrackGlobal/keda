@@ -53,6 +53,18 @@ var memoryString = "memory"
 var cpuString = "cpu"
 
 func (so *ScaledObject) SetupWebhookWithManager(mgr ctrl.Manager, cacheMissFallback bool) error {
+	err := setupKubernetesClients(mgr, cacheMissFallback)
+	if err != nil {
+		return fmt.Errorf("failed to setup kubernetes clients: %w", err)
+	}
+
+	return ctrl.NewWebhookManagedBy(mgr).
+		WithValidator(&ScaledObjectCustomValidator{}).
+		For(so).
+		Complete()
+}
+
+func setupKubernetesClients(mgr ctrl.Manager, cacheMissFallback bool) error {
 	kc = mgr.GetClient()
 	restMapper = mgr.GetRESTMapper()
 	cacheMissToDirectClient = cacheMissFallback
@@ -70,10 +82,8 @@ func (so *ScaledObject) SetupWebhookWithManager(mgr ctrl.Manager, cacheMissFallb
 			return fmt.Errorf("failed to initialize direct client: %w", err)
 		}
 	}
-	return ctrl.NewWebhookManagedBy(mgr).
-		WithValidator(&ScaledObjectCustomValidator{}).
-		For(so).
-		Complete()
+
+	return nil
 }
 
 // +kubebuilder:webhook:path=/validate-keda-sh-v1alpha1-scaledobject,mutating=false,failurePolicy=ignore,sideEffects=None,groups=keda.sh,resources=scaledobjects,verbs=create;update,versions=v1alpha1,name=vscaledobject.kb.io,admissionReviewVersions=v1
@@ -142,7 +152,7 @@ func isRemovingFinalizer(so *ScaledObject, old runtime.Object) bool {
 	soSpecString := string(soSpec)
 	oldSoSpecString := string(oldSoSpec)
 
-	return len(so.ObjectMeta.Finalizers) < len(oldSo.ObjectMeta.Finalizers) && soSpecString == oldSoSpecString
+	return len(so.Finalizers) < len(oldSo.Finalizers) && soSpecString == oldSoSpecString
 }
 
 func validateWorkload(so *ScaledObject, action string, dryRun bool) (admission.Warnings, error) {
@@ -242,7 +252,7 @@ func verifyHpas(incomingSo *ScaledObject, action string, _ bool) error {
 	}
 
 	for _, hpa := range hpaList.Items {
-		if hpa.ObjectMeta.Annotations[ValidationsHpaOwnershipAnnotation] == "false" {
+		if hpa.Annotations[ValidationsHpaOwnershipAnnotation] == "false" {
 			continue
 		}
 		val, _ := json.MarshalIndent(hpa, "", "  ")
@@ -267,9 +277,15 @@ func verifyHpas(incomingSo *ScaledObject, action string, _ bool) error {
 			}
 
 			if !owned {
-				if incomingSo.ObjectMeta.Annotations[ScaledObjectTransferHpaOwnershipAnnotation] == "true" &&
-					incomingSo.Spec.Advanced.HorizontalPodAutoscalerConfig.Name == hpa.Name {
-					scaledobjectlog.Info(fmt.Sprintf("%s hpa ownership being transferred to %s", hpa.Name, incomingSo.Name))
+				if incomingSo.Annotations[ScaledObjectTransferHpaOwnershipAnnotation] == "true" {
+					if incomingSo.Spec.Advanced != nil && incomingSo.Spec.Advanced.HorizontalPodAutoscalerConfig != nil && incomingSo.Spec.Advanced.HorizontalPodAutoscalerConfig.Name == hpa.Name {
+						scaledobjectlog.Info(fmt.Sprintf("%s hpa ownership being transferred to %s", hpa.Name, incomingSo.Name))
+					} else {
+						err = fmt.Errorf("the existing hpa '%s' for workload '%s' of type '%s' must be specified by name in advanced settings to enable ownership transfer", hpa.Name, incomingSo.Spec.ScaleTargetRef.Name, incomingSoGvkr.GVKString())
+						scaledobjectlog.Error(err, "validation error")
+						metricscollector.RecordScaledObjectValidatingErrors(incomingSo.Namespace, action, "transfer-ownership-missing-hpa-name")
+						return err
+					}
 				} else {
 					err = fmt.Errorf("the workload '%s' of type '%s' is already managed by the hpa '%s'", incomingSo.Spec.ScaleTargetRef.Name, incomingSoGvkr.GVKString(), hpa.Name)
 					scaledobjectlog.Error(err, "validation error")
