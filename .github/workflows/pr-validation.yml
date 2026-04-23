@@ -10,7 +10,11 @@ jobs:
   validate:
     name: validate - ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    container: ghcr.io/kedacore/keda-tools:1.23.8
+    container:
+      image: ghcr.io/kedacore/keda-tools:1.25.5
+      volumes:
+        - /usr:/host/usr
+        - /opt:/host/opt
     strategy:
       matrix:
         include:
@@ -18,9 +22,23 @@ jobs:
             name: arm64
           - runner: ubuntu-latest
             name: amd64
+          - runner: s390x
+            name: s390x
     steps:
+      - name: Maximize disk space
+        if: ${{ matrix.name == 'amd64' }}
+        run: |
+          # inspired by easimon/maximize-build-space action but it can't be easily used because this runs in a container
+          # https://github.com/easimon/maximize-build-space/blob/c28619d8999a147d5e09c1199f84ff6af6ad5794/action.yml#L41-L60
+          # remove android sdk => ~11GB
+          rm -rf /host/usr/local/lib/android
+          # remove .NET => ~17GB
+          rm -rf /host/usr/share/dotnet
+          # remove haskell => ~2.7GB
+          rm -rf /host/opt/ghc
+
       - name: Check out code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
           fetch-depth: 1
 
@@ -54,7 +72,7 @@ jobs:
           key: ${{ runner.os }}-go-build-cache-${{ hashFiles('**/go.sum') }}
 
       - name: Go modules sync
-        run: go mod tidy -compat=1.23
+        run: go mod tidy -compat=1.25
 
       - name: Verify generated Clientset is up to date
         run: make clientset-verify
@@ -62,25 +80,33 @@ jobs:
       - name: Verify generated Manifests are up to date
         run: make verify-manifests
 
+      - name: Verify generated Scalers schema is up to date
+        run: make verify-scalers-schema
+
       - name: Build
         run: make build
 
       - name: Test
         run: make test
 
+      - name: Test with race detector enabled
+        run: make test-race
+
       - name: Create test Summary
         uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86 # v2.4
         with:
-          paths: "report.xml"
+          paths: |
+            report.xml
+            report-race.xml
         if: always()
 
   validate-dockerfiles:
     permissions:
-      contents: read  # for dorny/paths-filter to fetch a list of changed files
-      pull-requests: read  # for dorny/paths-filter to read pull requests
+      contents: read # for dorny/paths-filter to fetch a list of changed files
+      pull-requests: read # for dorny/paths-filter to read pull requests
     name: validate-dockerfiles - ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    container: ghcr.io/kedacore/keda-tools:1.23.8
+    container: ghcr.io/kedacore/keda-tools:1.25.5
     strategy:
       matrix:
         include:
@@ -88,9 +114,11 @@ jobs:
             name: arm64
           - runner: ubuntu-latest
             name: amd64
+          - runner: s390x
+            name: s390x
     steps:
       - name: Check out code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
           fetch-depth: 1
 
@@ -110,11 +138,11 @@ jobs:
 
   validate-dev-container:
     permissions:
-      contents: read  # for dorny/paths-filter to fetch a list of changed files
-      pull-requests: read  # for dorny/paths-filter to read pull requests
+      contents: read # for dorny/paths-filter to fetch a list of changed files
+      pull-requests: read # for dorny/paths-filter to read pull requests
     name: Validate dev-container - ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    container: ghcr.io/kedacore/keda-tools:1.23.8
+    container: ghcr.io/kedacore/keda-tools:1.25.5
     strategy:
       matrix:
         include:
@@ -122,8 +150,10 @@ jobs:
             name: arm64
           - runner: ubuntu-latest
             name: amd64
+          - runner: s390x
+            name: s390x
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
       - name: Register workspace path
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -143,13 +173,13 @@ jobs:
     name: Static Checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5.5.0
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: 3.x
-      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
-          go-version: "1.23"
+          go-version-file: "go.mod"
       - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
 
   trivy-scan:

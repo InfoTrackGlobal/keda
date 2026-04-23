@@ -144,7 +144,7 @@ type PutMetricDataInput struct {
 	//
 	// This parameter is required when EntityMetricData is included.
 	//
-	// [How to add related information to telemetry]: https://docs.aws.amazon.com/adding-your-own-related-telemetry.html
+	// [How to add related information to telemetry]: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/adding-your-own-related-telemetry.html
 	StrictEntityValidation *bool
 
 	noSmithyDocumentSerde
@@ -251,16 +251,13 @@ func (c *Client) addOperationPutMetricDataMiddlewares(stack *middleware.Stack, o
 	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = addSpanInitializeStart(stack); err != nil {
+	if err = addInterceptBeforeRetryLoop(stack, options); err != nil {
 		return err
 	}
-	if err = addSpanInitializeEnd(stack); err != nil {
+	if err = addInterceptAttempt(stack, options); err != nil {
 		return err
 	}
-	if err = addSpanBuildRequestStart(stack); err != nil {
-		return err
-	}
-	if err = addSpanBuildRequestEnd(stack); err != nil {
+	if err = addInterceptors(stack, options); err != nil {
 		return err
 	}
 	return nil

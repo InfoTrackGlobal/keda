@@ -20,6 +20,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
@@ -67,13 +68,25 @@ func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1al
 
 	readyCondition := scaledJob.Status.Conditions.GetReadyCondition()
 	if isError {
-		// some triggers responded with error
-		// Set ScaledJob.Status.ReadyCondition to Unknown
-		msg := "Some triggers defined in ScaledJob are not working correctly"
-		logger.V(1).Info(msg)
-		if !readyCondition.IsUnknown() {
-			if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionUnknown, "PartialTriggerError", msg); err != nil {
-				logger.Error(err, "error setting ready condition")
+		if isActive {
+			// some triggers responded with error, but at least one is active
+			// Set ScaledJob.Status.ReadyCondition to Unknown
+			msg := "Some triggers defined in ScaledJob are not working correctly"
+			logger.V(1).Info(msg)
+			if !readyCondition.IsUnknown() {
+				if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionUnknown, "PartialTriggerError", msg); err != nil {
+					logger.Error(err, "error setting ready condition")
+				}
+			}
+		} else {
+			// all triggers responded with error (no active triggers)
+			// Set ScaledJob.Status.ReadyCondition to False
+			msg := "Triggers defined in ScaledJob are not working correctly"
+			logger.V(1).Info(msg)
+			if !readyCondition.IsFalse() {
+				if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionFalse, "TriggerError", msg); err != nil {
+					logger.Error(err, "error setting ready condition")
+				}
 			}
 		}
 	} else if !readyCondition.IsTrue() {
@@ -159,14 +172,27 @@ func (e *scaleExecutor) generateJobs(logger logr.Logger, scaledJob *kedav1alpha1
 		"app.kubernetes.io/managed-by": "keda-operator",
 		"scaledjob.keda.sh/name":       scaledJob.GetName(),
 	}
-	for key, value := range scaledJob.ObjectMeta.Labels {
+
+	excludedLabels := map[string]struct{}{}
+
+	if labels, ok := scaledJob.Annotations[kedav1alpha1.ScaledJobExcludedLabelsAnnotation]; ok {
+		for _, excludedLabel := range strings.Split(labels, ",") {
+			excludedLabels[excludedLabel] = struct{}{}
+		}
+	}
+
+	for key, value := range scaledJob.Labels {
+		if _, ok := excludedLabels[key]; ok {
+			continue
+		}
+
 		labels[key] = value
 	}
 
 	annotations := map[string]string{
 		"scaledjob.keda.sh/generation": strconv.FormatInt(scaledJob.Generation, 10),
 	}
-	for key, value := range scaledJob.ObjectMeta.Annotations {
+	for key, value := range scaledJob.Annotations {
 		annotations[key] = value
 	}
 
@@ -267,19 +293,29 @@ func (e *scaleExecutor) areAllPendingPodConditionsFulfilled(ctx context.Context,
 		return false
 	}
 
-	var fulfilledConditionsCount int
+	// Convert pendingPodConditions to a map for faster lookup
+	requiredConditions := make(map[string]struct{})
+	for _, condition := range pendingPodConditions {
+		requiredConditions[condition] = struct{}{}
+	}
 
+	// Check if any pod has all required conditions fulfilled
 	for _, pod := range pods.Items {
-		for _, pendingConditionType := range pendingPodConditions {
-			for _, podCondition := range pod.Status.Conditions {
-				if string(podCondition.Type) == pendingConditionType && podCondition.Status == corev1.ConditionTrue {
-					fulfilledConditionsCount++
-				}
+		fulfilledConditions := make(map[string]struct{})
+
+		for _, podCondition := range pod.Status.Conditions {
+			if _, isRequired := requiredConditions[string(podCondition.Type)]; isRequired && podCondition.Status == corev1.ConditionTrue {
+				fulfilledConditions[string(podCondition.Type)] = struct{}{}
 			}
+		}
+
+		// If this pod has all required conditions fulfilled, the job is no longer pending
+		if len(fulfilledConditions) == len(pendingPodConditions) {
+			return true
 		}
 	}
 
-	return len(pendingPodConditions) == fulfilledConditionsCount
+	return false
 }
 
 func (e *scaleExecutor) getPendingJobCount(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob) int64 {
@@ -378,7 +414,7 @@ func (e *scaleExecutor) deleteJobsWithHistoryLimit(ctx context.Context, logger l
 		if err != nil {
 			return err
 		}
-		logger.Info("Remove a job by reaching the historyLimit", "job.Name", j.ObjectMeta.Name, "historyLimit", historyLimit)
+		logger.Info("Remove a job by reaching the historyLimit", "job.Name", j.Name, "historyLimit", historyLimit)
 	}
 	return nil
 }

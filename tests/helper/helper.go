@@ -20,18 +20,24 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"text/template"
 	"time"
 
 	"github.com/joho/godotenv"
+	prommodel "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -43,6 +49,7 @@ import (
 )
 
 const (
+	ArgoRolloutsNamespace          = "argo-rollouts"
 	AzureWorkloadIdentityNamespace = "azure-workload-identity-system"
 	AwsIdentityNamespace           = "aws-identity-system"
 	GcpIdentityNamespace           = "gcp-identity-system"
@@ -58,9 +65,14 @@ const (
 	StringFalse = "false"
 	StringTrue  = "true"
 
-	StrimziVersion   = "0.35.0"
+	StrimziVersion   = "0.47.0"
 	StrimziChartName = "strimzi"
 	StrimziNamespace = "strimzi"
+)
+
+const (
+	WaitShort     = 20 * time.Second
+	IntervalShort = 1 * time.Second
 )
 
 const (
@@ -81,10 +93,18 @@ var (
 	AwsIdentityTests              = os.Getenv("AWS_RUN_IDENTITY_TESTS")
 	GcpIdentityTests              = os.Getenv("GCP_RUN_IDENTITY_TESTS")
 	EnableOpentelemetry           = os.Getenv("ENABLE_OPENTELEMETRY")
+	InstallArgoRollouts           = os.Getenv("E2E_INSTALL_ARGO_ROLLOUTS")
 	InstallCertManager            = AwsIdentityTests == StringTrue || GcpIdentityTests == StringTrue
 	InstallKeda                   = os.Getenv("E2E_INSTALL_KEDA")
 	InstallKafka                  = os.Getenv("E2E_INSTALL_KAFKA")
 )
+
+func init() {
+	if err := LoadTestConfig(); err != nil {
+		fmt.Printf("Error loading test config: %v\n", err)
+		os.Exit(1)
+	}
+}
 
 var (
 	KubeClient     *kubernetes.Clientset
@@ -137,10 +157,20 @@ func ExecuteCommand(cmdWithArgs string) ([]byte, error) {
 }
 
 func ExecuteCommandWithDir(cmdWithArgs, dir string) ([]byte, error) {
-	out, err := ParseCommandWithDir(cmdWithArgs, dir).Output()
+	return ExecuteCommandWithDirAndEnv(cmdWithArgs, dir, nil)
+}
+
+func ExecuteCommandWithDirAndEnv(cmdWithArgs, dir string, env map[string]string) ([]byte, error) {
+	cmd := ParseCommandWithDir(cmdWithArgs, dir)
+
+	cmd.Env = os.Environ()
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	out, err := cmd.Output()
 	if err != nil {
-		exitError, ok := err.(*exec.ExitError)
-		if ok {
+		if exitError, ok := err.(*exec.ExitError); ok {
 			return out, ExecutionError{StdError: exitError.Stderr}
 		}
 	}
@@ -149,6 +179,14 @@ func ExecuteCommandWithDir(cmdWithArgs, dir string) ([]byte, error) {
 }
 
 func ExecCommandOnSpecificPod(t *testing.T, podName string, namespace string, command string) (string, string, error) {
+	return executeCommandOnPod(t, podName, namespace, command, true)
+}
+
+func ExecCommandOnSpecificPodWithoutTTY(t *testing.T, podName string, namespace string, command string) (string, string, error) {
+	return executeCommandOnPod(t, podName, namespace, command, false)
+}
+
+func executeCommandOnPod(t *testing.T, podName string, namespace string, command string, tty bool) (string, string, error) {
 	cmd := []string{
 		"sh",
 		"-c",
@@ -164,7 +202,7 @@ func ExecCommandOnSpecificPod(t *testing.T, podName string, namespace string, co
 			Stdin:   false,
 			Stdout:  true,
 			Stderr:  true,
-			TTY:     true,
+			TTY:     tty,
 		}, scheme.ParameterCodec)
 	exec, err := remotecommand.NewSPDYExecutor(KubeConfig, "POST", request.URL())
 	assert.NoErrorf(t, err, "cannot execute command - %s", err)
@@ -358,6 +396,27 @@ func WaitForJobCountUntilIteration(t *testing.T, kc *kubernetes.Clientset, names
 	return isTargetAchieved
 }
 
+func WaitForJobCreation(t *testing.T, kc *kubernetes.Clientset, scaledJobName, namespace string, iterations, intervalSeconds int) (*batchv1.Job, error) {
+	jobList := &batchv1.JobList{}
+	var err error
+
+	for i := 0; i < iterations; i++ {
+		jobList, err = kc.BatchV1().Jobs(namespace).List(context.Background(), metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("scaledjob.keda.sh/name=%s", scaledJobName),
+		})
+
+		t.Log("Waiting for job creation")
+
+		if len(jobList.Items) > 0 {
+			return &jobList.Items[0], nil
+		}
+
+		time.Sleep(time.Duration(intervalSeconds) * time.Second)
+	}
+
+	return nil, err
+}
+
 // Waits until deployment count hits target or number of iterations are done.
 func WaitForPodCountInNamespace(t *testing.T, kc *kubernetes.Clientset, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
@@ -373,6 +432,35 @@ func WaitForPodCountInNamespace(t *testing.T, kc *kubernetes.Clientset, namespac
 		time.Sleep(time.Duration(intervalSeconds) * time.Second)
 	}
 
+	return false
+}
+
+// Waits until all the pods with a defined label are in completed status.
+func WaitForPodsCompleted(t *testing.T, kc *kubernetes.Clientset, selector, namespace string, iterations, intervalSeconds int) bool {
+	for i := 0; i < iterations; i++ {
+		pods, err := kc.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+		if (err != nil && errors.IsNotFound(err)) || len(pods.Items) == 0 {
+			t.Logf("No pods with label %s", selector)
+			return true
+		}
+
+		succeededCount := 0
+
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == corev1.PodSucceeded {
+				t.Logf("Pod %s in namespace %s is in completed status", pod.Name, namespace)
+				succeededCount++
+			}
+		}
+
+		if succeededCount == len(pods.Items) {
+			return true
+		}
+
+		t.Logf("Waiting for pods with label %s to complete", selector)
+
+		time.Sleep(time.Duration(intervalSeconds) * time.Second)
+	}
 	return false
 }
 
@@ -447,6 +535,41 @@ func WaitForDeploymentReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, 
 	return false
 }
 
+// Waits until rollout ready replica count hits target or number of iterations are done.
+func WaitForArgoRolloutReplicaReadyCount(t *testing.T, _ *kubernetes.Clientset, name, namespace string, target, iterations, intervalSeconds int) bool {
+	for i := 0; i < iterations; i++ {
+		// If target==0, we check for spec replicas, since .status.readyReplicas won't be set by the controller.
+		jsonPath := ".status.readyReplicas"
+		if target == 0 {
+			jsonPath = ".spec.replicas"
+		}
+
+		kctlGetCmd := fmt.Sprintf(`kubectl get rollouts.argoproj.io/%s -n %s -o jsonpath="{%s}"`, name, namespace, jsonPath)
+		output, err := ExecuteCommand(kctlGetCmd)
+		assert.NoErrorf(t, err, "cannot get rollout info - %s", err)
+
+		unquotedOutput := strings.ReplaceAll(string(output), "\"", "")
+
+		// Length of output can be zero, which means .status.readyReplicas is not yet set by the controller.
+		// In that case, sleep and check in the next iteration. Otherwise compare.
+		if len(unquotedOutput) != 0 {
+			replicas, err := strconv.ParseInt(unquotedOutput, 10, 64)
+			assert.NoErrorf(t, err, "cannot convert rollout count to int - %s", err)
+
+			t.Logf("Waiting for rollout replicas to hit target. Rollout - %s, Current  - %d, Target - %d",
+				name, replicas, target)
+
+			if replicas == int64(target) {
+				return true
+			}
+		}
+
+		time.Sleep(time.Duration(intervalSeconds) * time.Second)
+	}
+
+	return false
+}
+
 // Waits until statefulset count hits target or number of iterations are done.
 func WaitForStatefulsetReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, name, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
@@ -503,6 +626,44 @@ func AssertReplicaCountNotChangeDuringTimePeriod(t *testing.T, kc *kubernetes.Cl
 		if replicas != int32(target) {
 			assert.Fail(t, fmt.Sprintf("%s replica count has changed from %d to %d", name, target, replicas))
 			return
+		}
+
+		time.Sleep(time.Second)
+	}
+}
+
+// Waits some time to ensure that the replica count doesn't change.
+func AssertReplicaCountNotChangeDuringTimePeriodRollout(t *testing.T, _ *kubernetes.Clientset, name, namespace string, target, intervalSeconds int) {
+	t.Logf("Waiting for some time to ensure rollout replica count doesn't change from %d", target)
+	var replicas int64
+
+	for i := 0; i < intervalSeconds; i++ {
+		// If target==0, we check for spec replicas, since .status.readyReplicas won't be set by the controller.
+		jsonPath := ".status.replicas"
+		if target == 0 {
+			jsonPath = ".spec.replicas"
+		}
+
+		kctlGetCmd := fmt.Sprintf(`kubectl get rollouts.argoproj.io/%s -n %s -o jsonpath="{%s}"`, name, namespace, jsonPath)
+		output, err := ExecuteCommand(kctlGetCmd)
+		assert.NoErrorf(t, err, "cannot get rollout info - %s", err)
+
+		unquotedOutput := strings.ReplaceAll(string(output), "\"", "")
+
+		// Length of output can be zero, which means .status.replicas is not set by the controller.
+		// In that case, fail the test. Otherwise, compare.
+		if len(unquotedOutput) != 0 {
+			replicas, err = strconv.ParseInt(unquotedOutput, 10, 64)
+			assert.NoErrorf(t, err, "cannot convert rollout count to int - %s", err)
+
+			t.Logf("Rollout - %s, Current  - %d", name, replicas)
+
+			if replicas != int64(target) {
+				assert.Fail(t, fmt.Sprintf("%s replica count has changed from %d to %d", name, target, replicas))
+				return
+			}
+		} else {
+			assert.Fail(t, fmt.Sprintf("%s replicas are not set in its status, expected %d", name, target))
 		}
 
 		time.Sleep(time.Second)
@@ -912,4 +1073,270 @@ func CheckKubectlGetResult(t *testing.T, kind string, name string, namespace str
 
 	unqoutedOutput := strings.ReplaceAll(string(output), "\"", "")
 	assert.Equal(t, expected, unqoutedOutput)
+}
+
+// KedaEventually checks if the provided conditionFunc eventually returns true
+// (and no error) within the context's deadline. It polls the conditionFunc
+// at the given interval until the condition is met or the context times out.
+func KedaEventually(ctx context.Context, conditionFunc wait.ConditionWithContextFunc, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("polling interval must be positive, got %v", interval)
+	}
+
+	ok, err := conditionFunc(ctx)
+	if err != nil {
+		return fmt.Errorf("eventually check failed on initial check: %w", err)
+	}
+	if ok {
+		return nil
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("eventually check failed: context deadline exceeded before condition was met")
+
+		case <-ticker.C:
+			ok, err := conditionFunc(ctx)
+			if err != nil {
+				return fmt.Errorf("eventually check failed during polling: %w", err)
+			}
+			if ok {
+				return nil
+			}
+		}
+	}
+}
+
+// KedaConsistently checks if the provided conditionFunc consistently returns true
+// (and no error) for the entire duration specified by the context's deadline.
+// It polls the conditionFunc at the given interval.
+func KedaConsistently(ctx context.Context, conditionFunc wait.ConditionWithContextFunc, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("polling interval must be positive, got %v", interval)
+	}
+
+	ok, err := conditionFunc(ctx)
+	if err != nil {
+		return fmt.Errorf("consistency check failed on initial check: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("consistency check failed: condition was false on initial check")
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case <-ticker.C:
+			ok, err := conditionFunc(ctx)
+			if err != nil {
+				return fmt.Errorf("consistency check failed during polling: %w", err)
+			}
+			if !ok {
+				return fmt.Errorf("consistency check failed: condition returned false during polling period")
+			}
+		}
+	}
+}
+
+// EventWatchResult holds the outcome of the event watch.
+type EventWatchResult struct {
+	Event corev1.Event
+	Err   error
+}
+
+// StartEventWatch starts a watch for Kubernetes events matching the specified criteria.
+// It returns a channel that will receive the first matching event or an error if the watch fails.
+func StartEventWatch(
+	ctx context.Context,
+	t *testing.T,
+	clientset *kubernetes.Clientset,
+	namespace string,
+	involvedObjectName string,
+	involvedObjectKind string,
+	expectedReason string,
+	expectedType string,
+	expectedMessages []string,
+	resourceVersion string,
+) <-chan EventWatchResult {
+	t.Helper()
+	resultChan := make(chan EventWatchResult, 1)
+
+	fieldSelectorMap := fields.Set{
+		"involvedObject.name": involvedObjectName,
+		"involvedObject.kind": involvedObjectKind,
+		"reason":              expectedReason,
+		"type":                expectedType,
+	}
+	fieldSelector := fieldSelectorMap.String()
+
+	listOptions := metav1.ListOptions{
+		FieldSelector:   fieldSelector,
+		ResourceVersion: resourceVersion,
+	}
+
+	t.Logf("Starting event watch goroutine: namespace=%s, selector='%s', messages=%v, resourceVersion=%s",
+		namespace, fieldSelector, expectedMessages, resourceVersion)
+
+	watcher, err := clientset.CoreV1().Events(namespace).Watch(ctx, listOptions)
+	assert.NoErrorf(t, err, "failed to start watch for events with selector '%s' and rv %s: %s", fieldSelector, resourceVersion, err)
+	if err != nil {
+		resultChan <- EventWatchResult{Err: err}
+		close(resultChan)
+		return resultChan
+	}
+
+	go func() {
+		defer close(resultChan)
+		defer watcher.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				err := fmt.Errorf("watch context cancelled or timed out while waiting for event: %w", ctx.Err())
+				resultChan <- EventWatchResult{Err: err}
+				return
+
+			case watchEvent, ok := <-watcher.ResultChan():
+				if !ok {
+					err := fmt.Errorf("watcher channel closed unexpectedly for selector '%s'", fieldSelector)
+					if ctx.Err() != nil {
+						err = fmt.Errorf("watcher channel closed, likely due to context timeout: %w", ctx.Err())
+					}
+					resultChan <- EventWatchResult{Err: err}
+					return
+				}
+
+				switch watchEvent.Type {
+				case watch.Added, watch.Modified:
+					event, ok := watchEvent.Object.(*corev1.Event)
+					if !ok {
+						t.Logf("Received non-Event object type (%T) from watch, skipping", watchEvent.Object)
+						continue
+					}
+
+					t.Logf("Watch goroutine received event: %s/%s - %s %s (ts: %s): %s",
+						event.InvolvedObject.Kind, event.InvolvedObject.Name, event.Type, event.Reason,
+						event.LastTimestamp.Format(time.RFC3339), event.Message)
+
+					messageMatched := false
+					for _, expectedMsg := range expectedMessages {
+						if strings.Contains(event.Message, expectedMsg) {
+							messageMatched = true
+							break
+						}
+					}
+					if !messageMatched {
+						t.Logf(" -> Skipping event: Message '%s' did not match any of expected %v", event.Message, expectedMessages)
+						continue
+					}
+
+					t.Logf("Watch goroutine found matching event: %s/%s - %s %s: %s",
+						event.InvolvedObject.Kind, event.InvolvedObject.Name, event.Type, event.Reason, event.Message)
+					resultChan <- EventWatchResult{Event: *event}
+					return
+
+				case watch.Error:
+					status, ok := watchEvent.Object.(*metav1.Status)
+					var errMsg string
+					if ok {
+						errMsg = fmt.Sprintf("received watch.Error status: %s", status.Message)
+					} else {
+						errMsg = fmt.Sprintf("received watch.Error with unexpected object type %T: %v", watchEvent.Object, watchEvent.Object)
+					}
+					resultChan <- EventWatchResult{Err: fmt.Errorf("%s", errMsg)}
+					return
+
+				case watch.Deleted, watch.Bookmark:
+					continue
+				}
+			}
+		}
+	}()
+
+	return resultChan
+}
+
+// WatchForEventAfterTrigger starts watching for a specific Kubernetes event,
+// executes a trigger function, and then waits for the event to appear.
+func WatchForEventAfterTrigger(
+	t *testing.T,
+	kc *kubernetes.Clientset,
+	namespace string,
+	involvedObjectName string,
+	involvedObjectKind string,
+	expectedReason string,
+	expectedType string,
+	expectedMessages []string, // matches any of the messages
+	watchTimeout time.Duration,
+	triggerAction func() error,
+) {
+	t.Helper()
+
+	watchCtx, watchCancel := context.WithTimeout(context.Background(), watchTimeout)
+	defer watchCancel()
+
+	initialListOptions := metav1.ListOptions{
+		FieldSelector: fields.Set{
+			"involvedObject.name": involvedObjectName,
+			"involvedObject.kind": involvedObjectKind,
+			"reason":              expectedReason,
+			"type":                expectedType,
+		}.String(),
+		Limit: 1,
+	}
+
+	eventsList, err := kc.CoreV1().Events(namespace).List(watchCtx, initialListOptions)
+	require.NoError(t, err, "failed to get initial resource version for watch")
+
+	// Use the resource version from the initial list to start the watch
+	// This ensures we only get events that occur after the initial list
+	initialResourceVersion := eventsList.ResourceVersion
+
+	t.Logf("Waiting up to %s for Kubernetes event '%s' via watch...", watchTimeout, expectedReason)
+
+	resultChan := StartEventWatch(
+		watchCtx,
+		t,
+		kc,
+		namespace,
+		involvedObjectName,
+		involvedObjectKind,
+		expectedReason,
+		expectedType,
+		expectedMessages,
+		initialResourceVersion,
+	)
+
+	err = triggerAction()
+	require.NoError(t, err, "Trigger action failed")
+
+	select {
+	case result := <-resultChan:
+		assert.NoError(t, result.Err, "Event watch failed for %s", expectedReason)
+		if result.Err == nil {
+			t.Logf("Received expected Kubernetes event via watch: %s/%s - %s %s: %s",
+				result.Event.InvolvedObject.Kind, result.Event.InvolvedObject.Name, result.Event.Type, result.Event.Reason, result.Event.Message)
+		}
+
+	case <-time.After(watchTimeout + 5*time.Second):
+		assert.Fail(t, "Timed out waiting for result from Kubernetes event watch channel")
+	}
+}
+
+func ExtractPrometheusLabelValue(key string, labels []*prommodel.LabelPair) string {
+	for _, label := range labels {
+		if label.Name != nil && *label.Name == key {
+			return *label.Value
+		}
+	}
+	return ""
 }
