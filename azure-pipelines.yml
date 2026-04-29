@@ -20,10 +20,14 @@
 #   - Outbound egress to proxy.golang.org (pulled inside builder if no vendor
 #     cache hit — KEDA vendors dependencies so this should be rare)
 #
-# NOT YET REGISTERED IN ADO. Otis will register this pipeline definition
-# manually after review.
+# VERSION: bump the `version` variable below to match the KEDA release tag
+# (without the `v` prefix) before manually queueing this pipeline. The
+# git-versioning.yml template prepends `v` automatically, so `version: 2.19.0`
+# produces ECR image tags of `v2.19.0`.
 
 variables:
+  - name: version
+    value: '2.19.0'
   - name: docker_file_operator
     value: 'Dockerfile'
   - name: docker_file_adapter
@@ -78,6 +82,7 @@ stages:
           working_directory: $(working_directory)
           ecr_name: $(ecr_name_operator)
           repositoryname: $(repositoryname)
+          version: $(version)
 
   - stage: Build_MetricsApiserver
     jobs:
@@ -100,6 +105,7 @@ stages:
           working_directory: $(working_directory)
           ecr_name: $(ecr_name_adapter)
           repositoryname: $(repositoryname)
+          version: $(version)
 
   - stage: Build_AdmissionWebhooks
     jobs:
@@ -122,3 +128,4 @@ stages:
           working_directory: $(working_directory)
           ecr_name: $(ecr_name_webhooks)
           repositoryname: $(repositoryname)
+          version: $(version)

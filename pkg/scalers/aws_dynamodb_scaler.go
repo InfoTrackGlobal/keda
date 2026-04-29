@@ -181,11 +181,16 @@ func (s *awsDynamoDBScaler) GetQueryMetrics(ctx context.Context) (float64, error
 		ExpressionAttributeValues: s.metadata.expressionAttributeValues,
 	}
 
+	if len(s.metadata.FilterExpression) > 0 {
+		dimensions.FilterExpression = aws.String(s.metadata.FilterExpression)
+	}
+
 	if s.metadata.IndexName != "" {
 		dimensions.IndexName = aws.String(s.metadata.IndexName)
 	}
 
 	res, err := s.dbClient.Query(ctx, &dimensions)
+
 	if err != nil {
 		s.logger.Error(err, "Failed to get output")
 		return 0, err
