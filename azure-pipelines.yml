@@ -27,7 +27,7 @@
 
 variables:
   - name: version
-    value: '2.19.0'
+    value: '2.20.2'
   - name: docker_file_operator
     value: 'Dockerfile'
   - name: docker_file_adapter
