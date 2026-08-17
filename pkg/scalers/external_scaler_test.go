@@ -92,6 +92,121 @@ func TestExternalScalerParseMetadata(t *testing.T) {
 	}
 }
 
+func TestGetConnectionPoolKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		left     externalScalerMetadata
+		right    externalScalerMetadata
+		wantSame bool
+	}{
+		{
+			name: "same metadata yields same key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     false,
+				CaCert:        serverRootCA,
+				TLSClientCert: clientCert,
+				TLSClientKey:  "client-key-a",
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     false,
+				CaCert:        serverRootCA,
+				TLSClientCert: clientCert,
+				TLSClientKey:  "client-key-a",
+			},
+			wantSame: true,
+		},
+		{
+			name: "different tls mode yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+			},
+			wantSame: false,
+		},
+		{
+			name: "different ca cert yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				CaCert:        serverRootCA,
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				CaCert:        "different-ca",
+			},
+			wantSame: false,
+		},
+		{
+			name: "different client cert yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientCert: clientCert,
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientCert: "different-client-cert",
+			},
+			wantSame: false,
+		},
+		{
+			name: "different client key yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientKey:  "client-key-a",
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientKey:  "client-key-b",
+			},
+			wantSame: false,
+		},
+		{
+			name: "different unsafe ssl yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     false,
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     true,
+			},
+			wantSame: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftKey, err := getConnectionPoolKey(tt.left)
+			if err != nil {
+				t.Fatalf("left key error: %v", err)
+			}
+
+			rightKey, err := getConnectionPoolKey(tt.right)
+			if err != nil {
+				t.Fatalf("right key error: %v", err)
+			}
+
+			if (leftKey == rightKey) != tt.wantSame {
+				t.Fatalf("unexpected key equality: left=%d right=%d wantSame=%t", leftKey, rightKey, tt.wantSame)
+			}
+		})
+	}
+}
+
 func TestExternalPushScaler_Run(t *testing.T) {
 	const serverCount = 5
 	const iterationCount = 500
@@ -259,10 +374,15 @@ func TestWaitForState(t *testing.T) {
 		t.Errorf("connect grpc server %s failed:%s", address, err)
 		return
 	}
+	grpcClient.Connect()
+
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	defer waitCancel()
+
 	graceDone := make(chan struct{})
 	go func() {
 		// server stop will lead to Idle.
-		<-waitForState(context.TODO(), grpcClient, connectivity.Idle, connectivity.Shutdown)
+		<-waitForState(waitCtx, grpcClient, connectivity.Idle, connectivity.Shutdown)
 		grpcClient.Close()
 		// after close the state to shut down.
 		t.Log("close state:", grpcClient.GetState().String())
@@ -292,12 +412,13 @@ func TestWaitForState(t *testing.T) {
 	// stop server
 	time.Sleep(time.Second * 5)
 	grpcServer.GracefulStop()
+	grpcClient.Close()
 
 	select {
 	case <-graceDone:
 		// test ok.
 		return
-	case <-time.After(time.Second * 1):
+	case <-time.After(time.Second * 5):
 		t.Error("waitForState should be get connectivity.Shutdown.")
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
@@ -39,13 +40,10 @@ const (
 	defaultFailedJobsHistoryLimit     = int32(100)
 )
 
-func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob, isActive, isError bool, scaleTo int64, maxScale int64, options *ScaleExecutorOptions) {
+func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob, isActive, isError bool, scaleTo int64, maxScale int64, options ScaleExecutorOptions) ScaleResult {
 	logger := e.logger.WithValues("scaledJob.Name", scaledJob.Name, "scaledJob.Namespace", scaledJob.Namespace)
-
-	var activeTriggers []string
-	if options != nil {
-		activeTriggers = options.ActiveTriggers
-	}
+	result := ScaleResult{Conditions: kedav1alpha1.Conditions{}}
+	result.TriggersActivity = getTriggersActivity(scaledJob, options)
 
 	runningJobCount := e.getRunningJobCount(ctx, scaledJob)
 	pendingJobCount := e.getPendingJobCount(ctx, scaledJob)
@@ -60,81 +58,48 @@ func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1al
 
 	if isActive {
 		logger.V(1).Info("At least one scaler is active")
-		now := metav1.Now()
-		scaledJob.Status.LastActiveTime = &now
-		err := e.updateLastActiveTime(ctx, logger, scaledJob)
-		if err != nil {
-			logger.Error(err, "Failed to update last active time")
-		}
+		result.LastActiveTime = &metav1.Time{Time: time.Now()}
 		e.createJobs(ctx, logger, scaledJob, scaleTo, effectiveMaxScale)
 	} else {
 		logger.V(1).Info("No change in activity")
 	}
 
-	readyCondition := scaledJob.Status.Conditions.GetReadyCondition()
+	// initialize ready condition to true, following logic will change it in case of any errors
+	result.Conditions.SetReadyCondition(metav1.ConditionTrue, "ScaledJobReady", "ScaledJob is defined correctly and is ready for scaling")
 	if isError {
 		if isActive {
-			// some triggers responded with error, but at least one is active
-			// Set ScaledJob.Status.ReadyCondition to Unknown
+			// some triggers responded with error, but at least one is active -> set ScaledJob.Status.ReadyCondition to Unknown
 			msg := "Some triggers defined in ScaledJob are not working correctly"
 			logger.V(1).Info(msg)
-			if !readyCondition.IsUnknown() {
-				if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionUnknown, "PartialTriggerError", msg); err != nil {
-					logger.Error(err, "error setting ready condition")
-				}
-			}
+			result.Conditions.SetReadyCondition(metav1.ConditionUnknown, "PartialTriggerError", msg)
 		} else {
-			// all triggers responded with error (no active triggers)
-			// Set ScaledJob.Status.ReadyCondition to False
+			// all triggers responded with error (no active triggers) -> set ScaledJob.Status.ReadyCondition to False
 			msg := "Triggers defined in ScaledJob are not working correctly"
 			logger.V(1).Info(msg)
-			if !readyCondition.IsFalse() {
-				if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionFalse, "TriggerError", msg); err != nil {
-					logger.Error(err, "error setting ready condition")
-				}
-			}
-		}
-	} else if !readyCondition.IsTrue() {
-		// if the ScaledObject's triggers aren't in the error state,
-		// but ScaledJob.Status.ReadyCondition is set not set to 'true' -> set it back to 'true'
-		msg := "ScaledJob is defined correctly and is ready for scaling"
-		logger.V(1).Info(msg)
-		if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionTrue,
-			"ScaledJobReady", msg); err != nil {
-			logger.Error(err, "error setting ready condition")
+			result.Conditions.SetReadyCondition(metav1.ConditionFalse, "TriggerError", msg)
 		}
 	}
 
-	condition := scaledJob.Status.Conditions.GetActiveCondition()
-	if condition.IsUnknown() || condition.IsTrue() != isActive {
-		if isActive {
-			if !condition.IsTrue() {
-				e.recorder.Event(scaledJob, corev1.EventTypeNormal, eventreason.ScaledJobActive, "Scaling is performed because triggers are active")
-			}
-			if err := e.setActiveCondition(ctx, logger, scaledJob, metav1.ConditionTrue, "ScalerActive", "Scaling is performed because triggers are active"); err != nil {
-				logger.Error(err, "Error setting active condition when triggers are active")
-				return
-			}
-		} else {
-			if !condition.IsFalse() {
-				e.recorder.Event(scaledJob, corev1.EventTypeNormal, eventreason.ScaledJobInactive, "Scaling is not performed because triggers are not active")
-			}
-			if err := e.setActiveCondition(ctx, logger, scaledJob, metav1.ConditionFalse, "ScalerNotActive", "Scaling is not performed because triggers are not active"); err != nil {
-				logger.Error(err, "Error setting active condition when triggers are not active")
-				return
-			}
+	// set active condition and send events if the state has changed
+	activeCond := scaledJob.Status.Conditions.GetActiveCondition()
+	wasActive := activeCond.IsTrue()
+	if isActive {
+		if !wasActive {
+			e.recorder.Eventf(scaledJob, nil, corev1.EventTypeNormal, eventreason.ScaledJobActive, eventreason.ScaledJobActive, "%s", "Scaling is performed because triggers are active")
 		}
+		result.Conditions.SetActiveCondition(metav1.ConditionTrue, "ScalerActive", "Scaling is performed because triggers are active")
+	} else {
+		if wasActive {
+			e.recorder.Eventf(scaledJob, nil, corev1.EventTypeNormal, eventreason.ScaledJobInactive, eventreason.ScaledJobInactive, "%s", "Scaling is not performed because triggers are not active")
+		}
+		result.Conditions.SetActiveCondition(metav1.ConditionFalse, "ScalerNotActive", "Scaling is not performed because triggers are not active")
 	}
 
 	err := e.cleanUp(ctx, scaledJob)
 	if err != nil {
 		logger.Error(err, "Failed to cleanUp jobs")
 	}
-
-	// Update triggers activity if individual trigger states have changed
-	if err := e.updateTriggersActivity(ctx, logger, scaledJob, activeTriggers); err != nil {
-		logger.Error(err, "Error updating triggers activity")
-	}
+	return result
 }
 
 func (e *scaleExecutor) getScalingDecision(scaledJob *kedav1alpha1.ScaledJob, runningJobCount int64, scaleTo int64, maxScale int64, pendingJobCount int64, logger logr.Logger) (int64, int64) {
@@ -167,12 +132,12 @@ func (e *scaleExecutor) createJobs(ctx context.Context, logger logr.Logger, scal
 		err := e.client.Create(ctx, job)
 		if err != nil {
 			logger.Error(err, "Failed to create a new Job")
-			e.recorder.Eventf(scaledJob, corev1.EventTypeWarning, eventreason.KEDAJobCreateFailed, "Failed to create job %s: %v", job.GenerateName, err)
+			e.recorder.Eventf(scaledJob, nil, corev1.EventTypeWarning, eventreason.KEDAJobCreateFailed, eventreason.KEDAJobCreateFailed, "Failed to create job %s: %v", job.GenerateName, err)
 		}
 	}
 
 	logger.Info("Created jobs", "Number of jobs", scaleTo)
-	e.recorder.Eventf(scaledJob, corev1.EventTypeNormal, eventreason.KEDAJobsCreated, "Created %d jobs", scaleTo)
+	e.recorder.Eventf(scaledJob, nil, corev1.EventTypeNormal, eventreason.KEDAJobsCreated, eventreason.KEDAJobsCreated, "Created %d jobs", scaleTo)
 }
 
 func (e *scaleExecutor) generateJobs(logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob, scaleTo int64) []*batchv1.Job {
@@ -500,7 +465,16 @@ type customScalingStrategy struct {
 }
 
 func (s customScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, _, maxReplicaCount, scaleTo int64) (int64, int64) {
-	return min(maxScale-int64(*s.CustomScalingQueueLengthDeduction)-int64(float64(runningJobCount)*(*s.CustomScalingRunningJobPercentage)), maxReplicaCount), scaleTo
+	var deduction int64
+	if s.CustomScalingQueueLengthDeduction != nil {
+		deduction = int64(*s.CustomScalingQueueLengthDeduction)
+	}
+	var runningPercentage float64
+	if s.CustomScalingRunningJobPercentage != nil {
+		runningPercentage = *s.CustomScalingRunningJobPercentage
+	}
+	result := maxScale - deduction - int64(float64(runningJobCount)*runningPercentage)
+	return min(result, maxReplicaCount), scaleTo
 }
 
 type accurateScalingStrategy struct {

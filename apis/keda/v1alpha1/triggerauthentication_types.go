@@ -104,6 +104,9 @@ type TriggerAuthenticationSpec struct {
 
 	// +optional
 	BoundServiceAccountToken []BoundServiceAccountToken `json:"boundServiceAccountToken,omitempty"`
+
+	// +optional
+	OAuth2 *OAuth2 `json:"oauth2,omitempty"`
 }
 
 // TriggerAuthenticationStatus defines the observed state of TriggerAuthentication
@@ -161,6 +164,10 @@ type AuthPodIdentity struct {
 	// +kubebuilder:validation:Optional
 	// RoleArn sets the AWS RoleArn to be used. Mutually exclusive with IdentityOwner
 	RoleArn *string `json:"roleArn,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// ExternalID sets the External ID to be used when assuming an identity. This is only applicable when using AWS pod identity with a RoleArn.
+	ExternalID *string `json:"externalID,omitempty"`
 
 	// +kubebuilder:validation:Enum=keda;workload
 	// +optional
@@ -223,7 +230,8 @@ type AuthEnvironment struct {
 type HashiCorpVault struct {
 	Address        string              `json:"address"`
 	Authentication VaultAuthentication `json:"authentication"`
-	Secrets        []VaultSecret       `json:"secrets"`
+	// +kubebuilder:validation:MinItems=1
+	Secrets []VaultSecret `json:"secrets"`
 
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
@@ -251,6 +259,7 @@ type Credential struct {
 }
 
 // VaultAuthentication contains the list of Hashicorp Vault authentication methods
+// +kubebuilder:validation:Enum=token;kubernetes
 type VaultAuthentication string
 
 // Client authenticating to Vault
@@ -261,6 +270,7 @@ const (
 )
 
 // VaultSecretType defines the type of vault secret
+// +kubebuilder:validation:Enum="";secretV2;secret;pki
 type VaultSecretType string
 
 const (
@@ -292,8 +302,9 @@ type VaultSecret struct {
 
 // AzureKeyVault is used to authenticate using Azure Key Vault
 type AzureKeyVault struct {
-	VaultURI string                `json:"vaultUri"`
-	Secrets  []AzureKeyVaultSecret `json:"secrets"`
+	VaultURI string `json:"vaultUri"`
+	// +kubebuilder:validation:MinItems=1
+	Secrets []AzureKeyVaultSecret `json:"secrets"`
 	// +optional
 	Credentials *AzureKeyVaultCredentials `json:"credentials"`
 	// +optional
@@ -337,6 +348,7 @@ type AzureKeyVaultCloudInfo struct {
 }
 
 type GCPSecretManager struct {
+	// +kubebuilder:validation:MinItems=1
 	Secrets []GCPSecretManagerSecret `json:"secrets"`
 	// +optional
 	Credentials *GCPCredentials `json:"credentials"`
@@ -361,6 +373,7 @@ type GCPSecretManagerSecret struct {
 
 // AwsSecretManager is used to authenticate using AwsSecretManager
 type AwsSecretManager struct {
+	// +kubebuilder:validation:MinItems=1
 	Secrets []AwsSecretManagerSecret `json:"secrets"`
 	// +optional
 	Credentials *AwsSecretManagerCredentials `json:"credentials"`
@@ -395,6 +408,35 @@ type AwsSecretManagerSecret struct {
 type BoundServiceAccountToken struct {
 	Parameter          string `json:"parameter"`
 	ServiceAccountName string `json:"serviceAccountName"`
+}
+
+type OAuth2 struct {
+	// +kubebuilder:validation:Enum=clientCredentials
+	// +kubebuilder:default=clientCredentials
+	Type OAuth2GrantType `json:"type"`
+
+	ClientID string `json:"clientId"`
+
+	// +optional
+	ClientSecret OAuth2ClientSecret `json:"clientSecret,omitempty"`
+
+	TokenURL string `json:"tokenUrl"`
+
+	// +optional
+	Scopes []string `json:"scopes,omitempty"`
+
+	// +optional
+	TokenURLParams map[string]string `json:"tokenUrlParams,omitempty"`
+}
+
+type OAuth2GrantType string
+
+const (
+	OAuth2GrantTypeClientCredentials OAuth2GrantType = "clientCredentials"
+)
+
+type OAuth2ClientSecret struct {
+	ValueFrom ValueFromSecret `json:"valueFrom"`
 }
 
 func init() {
