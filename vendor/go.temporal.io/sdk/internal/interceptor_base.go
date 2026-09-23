@@ -573,9 +573,125 @@ func (c *ClientOutboundInterceptorBase) DescribeWorkflow(
 	return c.Next.DescribeWorkflow(ctx, in)
 }
 
-// ExecuteWorkflow implements ClientOutboundInterceptor.CreateSchedule.
+// CreateSchedule implements ClientOutboundInterceptor.CreateSchedule.
 func (c *ClientOutboundInterceptorBase) CreateSchedule(ctx context.Context, in *ScheduleClientCreateInput) (ScheduleHandle, error) {
 	return c.Next.CreateSchedule(ctx, in)
+}
+
+// ExecuteActivity implements ClientOutboundInterceptor.ExecuteActivity.
+func (c *ClientOutboundInterceptorBase) ExecuteActivity(
+	ctx context.Context,
+	in *ClientExecuteActivityInput,
+) (ClientActivityHandle, error) {
+	return c.Next.ExecuteActivity(ctx, in)
+}
+
+// GetActivityHandle implements ClientOutboundInterceptor.GetActivityHandle.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) GetActivityHandle(
+	in *ClientGetActivityHandleInput,
+) ClientActivityHandle {
+	return c.Next.GetActivityHandle(in)
+}
+
+// CancelActivity implements ClientOutboundInterceptor.CancelActivity.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) CancelActivity(
+	ctx context.Context,
+	in *ClientCancelActivityInput,
+) error {
+	return c.Next.CancelActivity(ctx, in)
+}
+
+// TerminateActivity implements ClientOutboundInterceptor.TerminateActivity.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) TerminateActivity(
+	ctx context.Context,
+	in *ClientTerminateActivityInput,
+) error {
+	return c.Next.TerminateActivity(ctx, in)
+}
+
+// DescribeActivity implements ClientOutboundInterceptor.DescribeActivity.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) DescribeActivity(
+	ctx context.Context,
+	in *ClientDescribeActivityInput,
+) (*ClientDescribeActivityOutput, error) {
+	return c.Next.DescribeActivity(ctx, in)
+}
+
+// PollActivityResult implements ClientOutboundInterceptor.PollActivityResult.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) PollActivityResult(
+	ctx context.Context,
+	in *ClientPollActivityResultInput,
+) (*ClientPollActivityResultOutput, error) {
+	return c.Next.PollActivityResult(ctx, in)
+}
+
+// ExecuteNexusOperation implements ClientOutboundInterceptor.ExecuteNexusOperation.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) ExecuteNexusOperation(
+	ctx context.Context,
+	in *ClientExecuteNexusOperationInput,
+) (ClientNexusOperationHandle, error) {
+	return c.Next.ExecuteNexusOperation(ctx, in)
+}
+
+// GetNexusOperationHandle implements ClientOutboundInterceptor.GetNexusOperationHandle.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) GetNexusOperationHandle(
+	in *ClientGetNexusOperationHandleInput,
+) ClientNexusOperationHandle {
+	return c.Next.GetNexusOperationHandle(in)
+}
+
+// CancelNexusOperation implements ClientOutboundInterceptor.CancelNexusOperation.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) CancelNexusOperation(
+	ctx context.Context,
+	in *ClientCancelNexusOperationInput,
+) error {
+	return c.Next.CancelNexusOperation(ctx, in)
+}
+
+// TerminateNexusOperation implements ClientOutboundInterceptor.TerminateNexusOperation.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) TerminateNexusOperation(
+	ctx context.Context,
+	in *ClientTerminateNexusOperationInput,
+) error {
+	return c.Next.TerminateNexusOperation(ctx, in)
+}
+
+// DescribeNexusOperation implements ClientOutboundInterceptor.DescribeNexusOperation.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) DescribeNexusOperation(
+	ctx context.Context,
+	in *ClientDescribeNexusOperationInput,
+) (*ClientDescribeNexusOperationOutput, error) {
+	return c.Next.DescribeNexusOperation(ctx, in)
+}
+
+// PollNexusOperationResult implements ClientOutboundInterceptor.PollNexusOperationResult.
+//
+// NOTE: Experimental
+func (c *ClientOutboundInterceptorBase) PollNexusOperationResult(
+	ctx context.Context,
+	in *ClientPollNexusOperationResultInput,
+) (*ClientPollNexusOperationResultOutput, error) {
+	return c.Next.PollNexusOperationResult(ctx, in)
 }
 
 func (*ClientOutboundInterceptorBase) mustEmbedClientOutboundInterceptorBase() {}

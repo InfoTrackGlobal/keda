@@ -130,7 +130,7 @@ func newElasticsearchClient(meta elasticsearchMetadata, logger logr.Logger) (*el
 		}
 	}
 
-	config.Transport = util.CreateHTTPTransport(meta.UnsafeSsl)
+	config.Transport = util.CreateRT(meta.UnsafeSsl)
 	esClient, err := elasticsearch.NewClient(config)
 	if err != nil {
 		logger.Error(err, fmt.Sprintf("Found error when creating client: %s", err))
@@ -146,6 +146,17 @@ func newElasticsearchClient(meta elasticsearchMetadata, logger logr.Logger) (*el
 }
 
 func (s *elasticsearchScaler) Close(_ context.Context) error {
+	return nil
+}
+
+// checkHTTPStatus returns a clear error for authentication and authorization failures
+func (s *elasticsearchScaler) checkHTTPStatus(statusCode int) error {
+	if statusCode == 401 {
+		return fmt.Errorf("elasticsearch authentication failed (HTTP 401): check username and password")
+	}
+	if statusCode == 403 {
+		return fmt.Errorf("elasticsearch authorization failed (HTTP 403): user has insufficient permissions")
+	}
 	return nil
 }
 
@@ -181,6 +192,11 @@ func (s *elasticsearchScaler) getQueryResult(ctx context.Context) (float64, erro
 	}
 
 	defer res.Body.Close()
+
+	if err := s.checkHTTPStatus(res.StatusCode); err != nil {
+		return 0, err
+	}
+
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return 0, err

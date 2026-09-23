@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -253,50 +254,190 @@ func TestNewTLSConfig_WithPassword(t *testing.T) {
 	}
 }
 
+func TestNewTLSConfig_ConcurrentCACertAppend(t *testing.T) {
+	const goroutines = 50
+
+	cas := []string{randomCACert, rsaCertPEM}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for i := range goroutines {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := NewTLSConfig(rsaCertPEM, rsaKeyPEM, cas[i%len(cas)], false)
+			if err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("unexpected error building TLS config: %s", err)
+	}
+}
+
+func TestNewTLSConfig_PerObjectCAIsolation(t *testing.T) {
+	before := getRootCAs().Clone()
+
+	configA, err := NewTLSConfig(rsaCertPEM, rsaKeyPEM, randomCACert, false)
+	if err != nil {
+		t.Fatalf("configA: %s", err)
+	}
+	configB, err := NewTLSConfig(rsaCertPEM, rsaKeyPEM, rsaCertPEM, false)
+	if err != nil {
+		t.Fatalf("configB: %s", err)
+	}
+
+	if configA.RootCAs.Equal(configB.RootCAs) {
+		t.Error("per-object CA certs leaked across configs: RootCAs pools are equal")
+	}
+
+	after := getRootCAs()
+	if !before.Equal(after) {
+		t.Error("shared root CA pool was mutated by per-object caCert append")
+	}
+}
+
 type minTLSVersionTestData struct {
-	envSet          bool
 	envValue        string
 	expectedVersion uint16
 }
 
 var minTLSVersionTestDatas = []minTLSVersionTestData{
 	{
-		envSet:          true,
 		envValue:        "TLS10",
 		expectedVersion: tls.VersionTLS10,
 	},
 	{
-		envSet:          true,
 		envValue:        "TLS11",
 		expectedVersion: tls.VersionTLS11,
 	},
 	{
-		envSet:          true,
 		envValue:        "TLS12",
 		expectedVersion: tls.VersionTLS12,
 	},
 	{
-		envSet:          true,
 		envValue:        "TLS13",
 		expectedVersion: tls.VersionTLS13,
 	},
 	{
-		envSet:          false,
+		envValue:        "",
 		expectedVersion: tls.VersionTLS12,
 	},
 }
 
 func TestResolveMinTLSVersion(t *testing.T) {
-	defer os.Unsetenv("KEDA_HTTP_MIN_TLS_VERSION")
 	for _, testData := range minTLSVersionTestDatas {
-		os.Unsetenv("KEDA_HTTP_MIN_TLS_VERSION")
-		if testData.envSet {
-			os.Setenv("KEDA_HTTP_MIN_TLS_VERSION", testData.envValue)
-		}
-		minVersion, _ := initMinTLSVersion()
+		minVersion, _ := ParseTLSVersion(testData.envValue, tls.VersionTLS12)
 
 		if testData.expectedVersion != minVersion {
 			t.Error("Failed to resolve minTLSVersion correctly", "wants", testData.expectedVersion, "got", minVersion)
 		}
 	}
+}
+
+func TestParseTLSCipherList(t *testing.T) {
+	// Collect valid cipher names from the runtime for use in tests
+	allCiphers := tls.CipherSuites()
+	if len(allCiphers) == 0 {
+		t.Skip("no cipher suites available")
+	}
+	first := allCiphers[0]
+	second := allCiphers[len(allCiphers)-1]
+
+	tests := []struct {
+		name    string
+		input   string
+		wantNil bool
+		wantIDs []uint16
+	}{
+		{
+			name:    "empty string returns nil",
+			input:   "",
+			wantNil: true,
+		},
+		{
+			name:    "unknown cipher names return nil",
+			input:   "NOT_A_CIPHER:ALSO_NOT_A_CIPHER",
+			wantNil: true,
+		},
+		{
+			name:    "single valid cipher colon-separated",
+			input:   first.Name,
+			wantIDs: []uint16{first.ID},
+		},
+		{
+			name:    "two valid ciphers colon-separated",
+			input:   first.Name + ":" + second.Name,
+			wantIDs: []uint16{first.ID, second.ID},
+		},
+		{
+			name:    "two valid ciphers comma-separated",
+			input:   first.Name + "," + second.Name,
+			wantIDs: []uint16{first.ID, second.ID},
+		},
+		{
+			name:    "valid cipher mixed with unknown cipher",
+			input:   first.Name + ":NOT_A_CIPHER",
+			wantIDs: []uint16{first.ID},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseTLSCipherList(tt.input)
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("expected nil, got %v", got)
+				}
+				return
+			}
+			if len(got) != len(tt.wantIDs) {
+				t.Fatalf("expected %d cipher(s), got %d: %v", len(tt.wantIDs), len(got), got)
+			}
+			for i, id := range tt.wantIDs {
+				if got[i] != id {
+					t.Errorf("cipher[%d]: expected 0x%04x, got 0x%04x", i, id, got[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseTLSCipherListEnvVar(t *testing.T) {
+	allCiphers := tls.CipherSuites()
+	if len(allCiphers) == 0 {
+		t.Skip("no cipher suites available")
+	}
+	first := allCiphers[0]
+
+	t.Run("env var unset returns nil", func(t *testing.T) {
+		os.Unsetenv("KEDA_HTTP_TLS_CIPHER_LIST")
+		if got := ParseTLSCipherList(os.Getenv("KEDA_HTTP_TLS_CIPHER_LIST")); got != nil {
+			t.Errorf("expected nil, got %v", got)
+		}
+	})
+
+	t.Run("env var set returns ciphers", func(t *testing.T) {
+		os.Setenv("KEDA_HTTP_TLS_CIPHER_LIST", first.Name)
+		defer os.Unsetenv("KEDA_HTTP_TLS_CIPHER_LIST")
+		got := ParseTLSCipherList(os.Getenv("KEDA_HTTP_TLS_CIPHER_LIST"))
+		if len(got) != 1 || got[0] != first.ID {
+			t.Errorf("expected [0x%04x], got %v", first.ID, got)
+		}
+	})
+
+	t.Run("all available ciphers colon-separated", func(t *testing.T) {
+		names := make([]string, len(allCiphers))
+		for i, c := range allCiphers {
+			names[i] = c.Name
+		}
+		got := ParseTLSCipherList(strings.Join(names, ":"))
+		if len(got) != len(allCiphers) {
+			t.Errorf("expected %d ciphers, got %d", len(allCiphers), len(got))
+		}
+	})
 }

@@ -334,6 +334,17 @@ func WaitForAllJobsSuccess(t *testing.T, kc *kubernetes.Clientset, namespace str
 	return false
 }
 
+// DeleteAllJobsInNamespace removes all Jobs (and their pods, via background propagation) in the
+// namespace, so a phase can reset the Job count for the next phase's assertions.
+func DeleteAllJobsInNamespace(t *testing.T, kc *kubernetes.Clientset, namespace string) {
+	policy := metav1.DeletePropagationBackground
+	err := kc.BatchV1().Jobs(namespace).DeleteCollection(context.Background(),
+		metav1.DeleteOptions{PropagationPolicy: &policy}, metav1.ListOptions{})
+	if err != nil {
+		t.Logf("cannot delete jobs in namespace %s - %s", namespace, err)
+	}
+}
+
 func WaitForNamespaceDeletion(t *testing.T, nsName string) bool {
 	for i := 0; i < 120; i++ {
 		t.Logf("waiting for namespace %s deletion", nsName)
@@ -490,6 +501,35 @@ func WaitForAllPodRunningInNamespace(t *testing.T, kc *kubernetes.Clientset, nam
 	return false
 }
 
+func WaitForRunningPodCount(t *testing.T, kc *kubernetes.Clientset, scaledJobName, namespace string, target, iterations, interval int) bool {
+	for i := 0; i < iterations; i++ {
+		pods, err := kc.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("scaledjob.keda.sh/name=%s", scaledJobName),
+		})
+		if err != nil {
+			t.Logf("cannot list pods - %s", err)
+		}
+
+		runningPodCount := 0
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == corev1.PodRunning {
+				runningPodCount++
+			}
+		}
+
+		t.Logf("Waiting for running pods. Namespace - %s, Current - %d, Target - %d",
+			namespace, runningPodCount, target)
+		if runningPodCount == target {
+			return true
+		} else if runningPodCount > target {
+			return false
+		}
+
+		time.Sleep(time.Duration(interval) * time.Second)
+	}
+	return false
+}
+
 // Waits until the Horizontal Pod Autoscaler for the scaledObject reports that it has metrics available
 // to calculate, or until the number of iterations are done, whichever happens first.
 func WaitForHPAMetricsToPopulate(t *testing.T, kc *kubernetes.Clientset, name, namespace string, iterations, intervalSeconds int) bool {
@@ -535,6 +575,24 @@ func WaitForDeploymentReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, 
 	return false
 }
 
+// Waits until pod is in ready state or number of iterations are done.
+func WaitForPodReady(t *testing.T, kc *kubernetes.Clientset, podName, namespace string, iterations, intervalSeconds int) bool {
+	for i := 0; i < iterations; i++ {
+		pod, _ := kc.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+		t.Logf("Waiting for pod to be in ready state. Pod - %s, Current Phase - %s", podName, pod.Status.Phase)
+
+		// A pod can be in the Running phase without all containers being ready.
+		// Check the Ready condition to ensure the pod is actually ready.
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				return true
+			}
+		}
+		time.Sleep(time.Duration(intervalSeconds) * time.Second)
+	}
+	return false
+}
+
 // Waits until rollout ready replica count hits target or number of iterations are done.
 func WaitForArgoRolloutReplicaReadyCount(t *testing.T, _ *kubernetes.Clientset, name, namespace string, target, iterations, intervalSeconds int) bool {
 	for i := 0; i < iterations; i++ {
@@ -577,6 +635,34 @@ func WaitForStatefulsetReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset,
 		replicas := statefulset.Status.ReadyReplicas
 
 		t.Logf("Waiting for statefulset replicas to hit target. Statefulset - %s, Current  - %d, Target - %d",
+			name, replicas, target)
+
+		if replicas == int32(target) {
+			return true
+		}
+
+		time.Sleep(time.Duration(intervalSeconds) * time.Second)
+	}
+
+	return false
+}
+
+// WaitForReplicaSetReplicaReadyCount waits until replicaset replica count hits target or number of iterations are done.
+func WaitForReplicaSetReplicaReadyCount(t *testing.T, kc *kubernetes.Clientset, name, namespace string, target, iterations, intervalSeconds int) bool {
+	for i := 0; i < iterations; i++ {
+		rs, _ := kc.AppsV1().ReplicaSets(namespace).Get(context.Background(), name, metav1.GetOptions{})
+
+		// Use spec.replicas when target is 0 (status.readyReplicas won't be set)
+		var replicas int32
+		if target == 0 {
+			if rs.Spec.Replicas != nil {
+				replicas = *rs.Spec.Replicas
+			}
+		} else {
+			replicas = rs.Status.ReadyReplicas
+		}
+
+		t.Logf("Waiting for replicaset replicas to hit target. ReplicaSet - %s, Current - %d, Target - %d",
 			name, replicas, target)
 
 		if replicas == int32(target) {
